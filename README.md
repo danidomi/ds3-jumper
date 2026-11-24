@@ -114,7 +114,7 @@ Press **SELECT** (or **F3**) any time to toggle a one-line performance overlay
 in the top-left corner:
 
 ```text
-FPS 60 | FRAME 16.7MS (MAX 17.2) | CPU 6% | UPDATE 0.12MS | DRAW 1.90MS | MEM 41MB | PHYS 2/F | OBJ 58 | PAD WIRED
+FPS 60 | FRAME 16.7MS (MAX 17.2) | CPU 6% | UPD 0.12MS | DRAW 1.90MS | MEM 41MB | PHYS 2/F | OBJ 58 | PAD WIRED
 ```
 
 FPS and frame time (average / worst in the last 0.5 s), process CPU usage,

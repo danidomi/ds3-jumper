@@ -480,7 +480,7 @@ static void genChunk(void) {
     if (frand() < 0.45f) {
         float fw = 80 + frand() * 90;
         float fx = x + frand() * fmaxf(1, w - fw);
-        float fy = newY - 105 - frand() * 25;
+        float fy = newY - 90 - frand() * 25; /* a full jump rises ~120 px */
         addSolid(fx, fy, fw, 14, false);
         int n = (int)(fw / 28);
         for (int i = 0; i < n; i++) addCoin(fx + 14 + i * 28, fy - 26);
@@ -841,6 +841,7 @@ static const char *glyph(char c) {
     case ',': return "000000000010100"; case '\'': return "010010000000000";
     case '<': return "001010100010001"; case '>': return "100010001010100";
     case '%': return "101001010100101"; case '=': return "000111000111000";
+    case '|': return "010010010010010";
     default: return NULL;
     }
 }
@@ -1226,7 +1227,7 @@ static void drawDev(void) {
     }
     char line[200];
     snprintf(line, sizeof line,
-             "FPS %.0f | FRAME %.1fMS (MAX %.1f) | CPU %.0f%% | UPDATE %.2fMS | DRAW %.2fMS | MEM %.0fMB | PHYS %d/F | OBJ %d | %s",
+             "FPS %.0f | FRAME %.1fMS (MAX %.1f) | CPU %.0f%% | UPD %.2fMS | DRAW %.2fMS | MEM %.0fMB | PHYS %d/F | OBJ %d | %s",
              G.fps, G.frameMs, G.frameMsMax, G.cpuPct, G.updMs, G.drawMs, G.memMB, G.stepsThisFrame,
              G.nSolids + G.nCoins + G.nEnemies + G.nParts, pad);
     color(0, 0, 0, 170);
@@ -1631,8 +1632,8 @@ int main(int argc, char **argv) {
             } else if (in.psP) G.quit = true;
             break;
         case ST_OVER:
-            if (in.confirmP || in.startP) newGame();
-            else if (in.backP) { audio_play(SFX_MENU_BACK); toTitle(); }
+            if (in.backP) { audio_play(SFX_MENU_BACK); toTitle(); } /* before start: ESC is both */
+            else if (in.confirmP || in.startP) newGame();
             else if (in.psP) G.quit = true;
             break;
         case ST_SETTINGS:
