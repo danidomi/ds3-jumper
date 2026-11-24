@@ -60,7 +60,25 @@ play_seconds = 1260
 last_played = 2026-11-24 15:55
 ```
 
-Your best score and totals are shown on the title screen. Delete the file to reset.
+Your best score and totals are shown on the title screen, and printed in the
+terminal when the game starts and when you quit:
+
+```text
+Best score: 2615  (14 games played)
+...
+Last score: 1830   Best score: 2615
+```
+
+Delete the file to reset.
+
+## Dev mode
+
+Press **SELECT** (or **F3**) any time to toggle an overlay with FPS and frame
+time, physics steps per frame, renderer/VSync, output resolution, player
+position/velocity/state, camera and difficulty, entity counts, a score
+breakdown, and live controller data (sticks, L2/R2 pressure, pressed buttons,
+battery). During play it also draws hitboxes and enemy patrol ranges.
+Start with it on using `./ds3-jumper --dev`.
 
 ## Controls
 
@@ -70,7 +88,7 @@ Your best score and totals are shown on the title screen. Delete the file to res
 | ✕ Cross | Space / Up / W / Z | Jump (hold for higher) |
 | □ Square / R2 | Shift / X | Run |
 | START | Enter / Esc / P | Pause |
-| SELECT | R | Restart |
+| SELECT | F3 / ` | Dev mode (FPS, metrics, hitboxes) |
 | △ Triangle | F / F11 | Toggle fullscreen |
 | PS | Q | Pause / quit (from menus) |
 

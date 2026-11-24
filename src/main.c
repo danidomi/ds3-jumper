@@ -109,7 +109,13 @@ static struct {
     float safeX, safeY;
 
     int lives, coins, bonus, score, best, stomps;
-    bool runActive, noSave;
+    bool runActive, noSave, newBest, playedThisSession, sessionNewBest;
+
+    /* dev mode */
+    bool dev;
+    int stepsThisFrame;
+    float fpsTimer, fps, frameMs, frameMsMax, frameMsMaxAcc;
+    int fpsFrames;
     float runSeconds;
     float dist, camX, time, shake;
 
@@ -263,7 +269,9 @@ static void endRun(void) {
     if (G.score <= 0 && G.runSeconds < 1) return; /* never really played */
     S.games++;
     S.last = G.score;
-    if (G.score > S.best) S.best = G.score;
+    G.playedThisSession = true;
+    G.newBest = G.score > S.best;
+    if (G.newBest) { S.best = G.score; G.sessionNewBest = true; }
     S.coinsTotal += G.coins;
     if (G.coins > S.bestCoins) S.bestCoins = G.coins;
     S.stompsTotal += G.stomps;
@@ -587,7 +595,7 @@ static void readInput(Input *in, float dt) {
     h.jump = k[SDL_SCANCODE_SPACE] || k[SDL_SCANCODE_UP] || k[SDL_SCANCODE_W] || k[SDL_SCANCODE_Z];
     h.run = k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT] || k[SDL_SCANCODE_X];
     h.start = k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_ESCAPE] || k[SDL_SCANCODE_P];
-    h.select = k[SDL_SCANCODE_R];
+    h.select = k[SDL_SCANCODE_F3] || k[SDL_SCANCODE_GRAVE]; /* dev mode */
     h.tri = k[SDL_SCANCODE_F] || k[SDL_SCANCODE_F11];
     h.ps = k[SDL_SCANCODE_Q];
     h.confirm = k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_SPACE];
@@ -683,7 +691,7 @@ static const char *glyph(char c) {
     case ')': return "010001001001010"; case '+': return "000010111010000";
     case ',': return "000000000010100"; case '\'': return "010010000000000";
     case '<': return "001010100010001"; case '>': return "100010001010100";
-    case '%': return "101001010100101";
+    case '%': return "101001010100101"; case '=': return "000111000111000";
     default: return NULL;
     }
 }
@@ -855,8 +863,10 @@ static void drawHUD(void) {
     text(buf, 20, 16, 4, 255, 255, 255, false);
     snprintf(buf, sizeof buf, "COINS %d", G.coins);
     text(buf, 20, 44, 3, 255, 225, 90, false);
-    snprintf(buf, sizeof buf, "BEST %d", G.best);
-    text(buf, VW - 20 - textWidth(buf, 3), 16, 3, 230, 240, 255, false);
+    if (G.best > 0) {
+        snprintf(buf, sizeof buf, "BEST %d", G.best);
+        text(buf, VW - 20 - textWidth(buf, 3), 16, 3, 230, 240, 255, false);
+    }
     for (int i = 0; i < START_LIVES; i++) {
         float x = VW - 20 - (START_LIVES - i) * 26.0f, y = 42;
         color(20, 24, 40, 160); fillS(x + 2, y + 2, 20, 18);
@@ -958,6 +968,104 @@ static void drawSettings(void) {
     drawHint("UP/DOWN: CHOOSE    LEFT/RIGHT: CHANGE    CIRCLE / ESC: BACK");
 }
 
+/* ------------------------------------------------------------ dev mode */
+
+static void outlineW(float x, float y, float w, float h) {
+    SDL_FRect rc = { x - G.camX + shakeX, y + shakeY, w, h };
+    SDL_RenderDrawRectF(G.ren, &rc);
+}
+
+static void drawHitboxes(void) {
+    color(80, 255, 255, 200);
+    for (int i = 0; i < G.nSolids; i++)
+        outlineW(G.solids[i].x, G.solids[i].y, G.solids[i].w, G.solids[i].ground ? 40 : G.solids[i].h);
+    color(255, 230, 0, 220);
+    for (int i = 0; i < G.nCoins; i++) outlineW(G.coinArr[i].x - 7, G.coinArr[i].y - 7, 14, 14);
+    color(255, 60, 200, 230);
+    for (int i = 0; i < G.nEnemies; i++) {
+        Enemy *e = &G.enemies[i];
+        outlineW(e->x, e->y, EW, EH);
+        color(255, 60, 200, 90);
+        outlineW(e->minx, e->y + EH + 2, e->maxx - e->minx + EW, 2); /* patrol range */
+        color(255, 60, 200, 230);
+    }
+    color(G.onGround ? 80 : 255, 255, 80, 255);
+    outlineW(G.px, G.py, PW, PH);
+}
+
+static const char *powerName(SDL_JoystickPowerLevel p) {
+    switch (p) {
+    case SDL_JOYSTICK_POWER_EMPTY: return "EMPTY";
+    case SDL_JOYSTICK_POWER_LOW: return "LOW";
+    case SDL_JOYSTICK_POWER_MEDIUM: return "MEDIUM";
+    case SDL_JOYSTICK_POWER_FULL: return "FULL";
+    case SDL_JOYSTICK_POWER_WIRED: return "WIRED (USB)";
+    case SDL_JOYSTICK_POWER_MAX: return "MAX";
+    default: return "UNKNOWN";
+    }
+}
+
+static void drawDev(void) {
+    char l[24][96];
+    int n = 0;
+#define LINE(...) snprintf(l[n++], sizeof l[0], __VA_ARGS__)
+    SDL_RendererInfo ri = { 0 };
+    SDL_GetRendererInfo(G.ren, &ri);
+    int ow = 0, oh = 0;
+    SDL_GetRendererOutputSize(G.ren, &ow, &oh);
+    static const char *stateNames[] = { "TITLE", "PLAY", "PAUSE", "GAME OVER", "SETTINGS" };
+
+    LINE("DEV MODE  (SELECT / F3 TO HIDE)");
+    LINE("FPS %.0f   FRAME %.1f MS   MAX %.1f MS", G.fps, G.frameMs, G.frameMsMax);
+    LINE("PHYSICS STEPS/FRAME %d  (%.0f HZ)", G.stepsThisFrame, 1 / STEP);
+    LINE("RENDERER %s   VSYNC %s", ri.name ? ri.name : "?",
+         (ri.flags & SDL_RENDERER_PRESENTVSYNC) ? "ON" : "OFF");
+    LINE("OUTPUT %dX%d   LOGICAL %dX%d", ow, oh, VW, VH);
+    LINE("STATE %s   TIME %.1fS", stateNames[G.st], G.runSeconds);
+    LINE("POS %.0f, %.0f   VEL %.0f, %.0f", G.px, G.py, G.vx, G.vy);
+    LINE("GROUND %s  COYOTE %.2f  JUMPBUF %.2f  INVULN %.1f", G.onGround ? "YES" : "NO",
+         fmaxf(0, G.coyote), fmaxf(0, G.jumpBuf), G.invuln);
+    LINE("CAM %.0f   GEN %.0f   DIFFICULTY %.0f%%", G.camX, G.genX,
+         clampf(G.genX / 25000.0f, 0, 1) * 100);
+    LINE("SOLIDS %d  COINS %d  ENEMIES %d  PARTICLES %d", G.nSolids, G.nCoins, G.nEnemies, G.nParts);
+    LINE("SCORE %d = DIST %.0f + COINS %dX10 + STOMPS %d", G.score, G.dist, G.coins, G.bonus);
+    if (G.pad) {
+        SDL_Joystick *js = SDL_GameControllerGetJoystick(G.pad);
+        LINE("PAD %s   BATTERY %s", SDL_GameControllerName(G.pad), powerName(SDL_JoystickCurrentPowerLevel(js)));
+        LINE("L STICK %+.2f %+.2f   R STICK %+.2f %+.2f", axis(SDL_CONTROLLER_AXIS_LEFTX),
+             axis(SDL_CONTROLLER_AXIS_LEFTY), axis(SDL_CONTROLLER_AXIS_RIGHTX), axis(SDL_CONTROLLER_AXIS_RIGHTY));
+        LINE("L2 %3.0f%%   R2 %3.0f%%   RUMBLE %s", axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT) * 100,
+             axis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT) * 100,
+             SDL_GameControllerHasRumble(G.pad) ? (CFG.rumble ? "ON" : "OFF") : "N/A");
+        static const struct { SDL_GameControllerButton b; const char *n; } B[] = {
+            { SDL_CONTROLLER_BUTTON_A, "CROSS" }, { SDL_CONTROLLER_BUTTON_B, "CIRCLE" },
+            { SDL_CONTROLLER_BUTTON_X, "SQUARE" }, { SDL_CONTROLLER_BUTTON_Y, "TRIANGLE" },
+            { SDL_CONTROLLER_BUTTON_LEFTSHOULDER, "L1" }, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, "R1" },
+            { SDL_CONTROLLER_BUTTON_LEFTSTICK, "L3" }, { SDL_CONTROLLER_BUTTON_RIGHTSTICK, "R3" },
+            { SDL_CONTROLLER_BUTTON_DPAD_UP, "UP" }, { SDL_CONTROLLER_BUTTON_DPAD_DOWN, "DOWN" },
+            { SDL_CONTROLLER_BUTTON_DPAD_LEFT, "LEFT" }, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT, "RIGHT" },
+            { SDL_CONTROLLER_BUTTON_START, "START" }, { SDL_CONTROLLER_BUTTON_BACK, "SELECT" },
+            { SDL_CONTROLLER_BUTTON_GUIDE, "PS" },
+        };
+        char pressed[96] = "BUTTONS:";
+        for (int i = 0; i < LEN(B); i++)
+            if (btn(B[i].b) && strlen(pressed) + strlen(B[i].n) + 2 < sizeof pressed) {
+                strcat(pressed, " ");
+                strcat(pressed, B[i].n);
+            }
+        LINE("%s", pressed);
+    } else {
+        LINE("PAD NONE (KEYBOARD)");
+    }
+#undef LINE
+
+    float x = 16, y = 76, lh = 15;
+    color(5, 8, 20, 190);
+    fillS(x - 6, y - 6, 470, n * lh + 10);
+    for (int i = 0; i < n; i++)
+        text(l[i], x, y + i * lh, 2, i == 0 ? 255 : 160, i == 0 ? 220 : 255, i == 0 ? 80 : 170, false);
+}
+
 static void render(void) {
     shakeX = shakeY = 0;
     if (G.shake > 0) {
@@ -966,6 +1074,7 @@ static void render(void) {
     }
     drawBackground();
     drawWorld();
+    if (G.dev && G.st == ST_PLAY) drawHitboxes();
 
     switch (G.st) {
     case ST_TITLE:
@@ -996,20 +1105,23 @@ static void render(void) {
     case ST_OVER:
         drawHUD();
         overlay(160);
-        text("GAME OVER", VW / 2, 140, 10, 255, 110, 100, true);
+        text("GAME OVER", VW / 2, 120, 10, 255, 110, 100, true);
         {
             char buf[64];
             snprintf(buf, sizeof buf, "SCORE %d   BEST %d", G.score, G.best);
-            text(buf, VW / 2, 240, 4, 255, 255, 255, true);
+            text(buf, VW / 2, 220, 4, 255, 255, 255, true);
         }
+        if (G.newBest && fmodf(G.time, 0.5f) < 0.35f)
+            text("NEW BEST!", VW / 2, 265, 5, 255, 220, 80, true);
         if (fmodf(G.time, 1.0f) < 0.65f)
-            text("PRESS CROSS TO PLAY AGAIN", VW / 2, 300, 3, 255, 255, 255, true);
+            text("PRESS CROSS TO PLAY AGAIN", VW / 2, 320, 3, 255, 255, 255, true);
         drawHint("CIRCLE / ESC: MAIN MENU");
         break;
     case ST_SETTINGS:
         drawSettings();
         break;
     }
+    if (G.dev) drawDev();
 }
 
 /* ------------------------------------------------------------ menus */
@@ -1104,8 +1216,9 @@ int main(int argc, char **argv) {
             shotView = !strcmp(v, "title") ? ST_TITLE : !strcmp(v, "pause") ? ST_PAUSE
                      : !strcmp(v, "settings") ? ST_SETTINGS : !strcmp(v, "over") ? ST_OVER : ST_PLAY;
         } else if (!strcmp(argv[i], "--stats")) stats = true;
+        else if (!strcmp(argv[i], "--dev")) G.dev = true;
         else {
-            printf("usage: %s [--windowed] [--stats] [--screenshot out.bmp [--screen title|play|pause|settings|over]]\n",
+            printf("usage: %s [--windowed] [--dev] [--stats] [--screenshot out.bmp [--screen title|play|pause|settings|over]]\n",
                    argv[0]);
             return !strcmp(argv[i], "--help") || !strcmp(argv[i], "-h") ? 0 : 2;
         }
@@ -1162,6 +1275,12 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < SDL_NumJoysticks(); i++) openPad(i);
 
+    if (S.games > 0)
+        printf("Best score: %d  (%d games played)\n", S.best, S.games);
+    else
+        printf("No best score yet - go set one!\n");
+    fflush(stdout);
+
     toTitle();
 
     Uint64 last = SDL_GetPerformanceCounter();
@@ -1189,10 +1308,23 @@ int main(int argc, char **argv) {
         Uint64 now = SDL_GetPerformanceCounter();
         float dt = (float)(now - last) / (float)SDL_GetPerformanceFrequency();
         last = now;
+
+        /* FPS / frame-time stats for dev mode, measured on the real frame time */
+        G.fpsFrames++;
+        G.fpsTimer += dt;
+        G.frameMsMaxAcc = fmaxf(G.frameMsMaxAcc, dt * 1000);
+        if (G.fpsTimer >= 0.5f) {
+            G.fps = G.fpsFrames / G.fpsTimer;
+            G.frameMs = G.fpsTimer * 1000 / G.fpsFrames;
+            G.frameMsMax = G.frameMsMaxAcc;
+            G.fpsFrames = 0; G.fpsTimer = 0; G.frameMsMaxAcc = 0;
+        }
         if (dt > 0.05f) dt = 0.05f;
 
         readInput(&in, dt);
         if (in.triP) setFullscreen(!G.fullscreen);
+        if (in.selectP) { G.dev = !G.dev; audio_play(SFX_TOGGLE); }
+        G.stepsThisFrame = 0;
 
         switch (G.st) {
         case ST_TITLE:
@@ -1211,12 +1343,12 @@ int main(int argc, char **argv) {
                 audio_play(SFX_MENU_OK);
                 break;
             }
-            if (in.selectP) { newGame(); break; }
             if (in.jumpP) G.jumpBuf = 0.12f;
             acc += dt;
             while (acc >= STEP && G.st == ST_PLAY) {
                 update(STEP, &in);
                 acc -= STEP;
+                G.stepsThisFrame++;
             }
             break;
         case ST_PAUSE:
@@ -1234,11 +1366,10 @@ int main(int argc, char **argv) {
             } else if (in.startP || in.backP) {
                 G.st = ST_PLAY;
                 audio_play(SFX_MENU_BACK);
-            } else if (in.selectP) newGame();
-            else if (in.psP) G.quit = true;
+            } else if (in.psP) G.quit = true;
             break;
         case ST_OVER:
-            if (in.confirmP || in.startP || in.selectP) newGame();
+            if (in.confirmP || in.startP) newGame();
             else if (in.backP) { audio_play(SFX_MENU_BACK); toTitle(); }
             else if (in.psP) G.quit = true;
             break;
@@ -1259,6 +1390,11 @@ int main(int argc, char **argv) {
 
     endRun(); /* save a run that was in progress when quitting */
     writeSettings();
+    if (G.playedThisSession) {
+        printf("Last score: %d   Best score: %d%s\n", S.last, S.best,
+               G.sessionNewBest ? "  (NEW BEST this session!)" : "");
+        printf("Stats: %s\n", savePath);
+    }
     audio_quit();
     if (G.pad) SDL_GameControllerClose(G.pad);
     SDL_DestroyRenderer(G.ren);
