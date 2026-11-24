@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define VW 960 /* logical screen size; scaled to the window */
 #define VH 540
@@ -60,7 +61,9 @@ static struct {
     int facing;
     float safeX, safeY;
 
-    int lives, coins, bonus, score, best;
+    int lives, coins, bonus, score, best, stomps;
+    bool runActive, noSave;
+    float runSeconds;
     float dist, camX, time, shake;
 
     Solid solids[MAX_SOLIDS]; int nSolids;
@@ -210,9 +213,88 @@ static void prune(void) {
     G.nEnemies = j;
 }
 
+/* ------------------------------------------------------------ save file */
+
+/* Plain "key=value" text file in the per-user data directory. */
+static struct {
+    int best, last, games, coinsTotal, bestCoins, stompsTotal;
+    double distanceTotal, playSeconds;
+} S;
+static char savePath[1024];
+
+static void initSavePath(void) {
+    const char *env = getenv("DS3_JUMPER_SAVE");
+    if (env && *env) { snprintf(savePath, sizeof savePath, "%s", env); return; }
+    char *dir = SDL_GetPrefPath("danidomi", "ds3-jumper"); /* creates the folder */
+    if (dir) {
+        snprintf(savePath, sizeof savePath, "%ssave.txt", dir);
+        SDL_free(dir);
+    }
+}
+
+static void loadSave(void) {
+    FILE *f = savePath[0] ? fopen(savePath, "r") : NULL;
+    if (!f) return;
+    char line[256], key[64];
+    double v;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || sscanf(line, " %63[^= ] = %lf", key, &v) != 2) continue;
+        if (!strcmp(key, "best_score")) S.best = (int)v;
+        else if (!strcmp(key, "last_score")) S.last = (int)v;
+        else if (!strcmp(key, "games_played")) S.games = (int)v;
+        else if (!strcmp(key, "coins_total")) S.coinsTotal = (int)v;
+        else if (!strcmp(key, "best_coins")) S.bestCoins = (int)v;
+        else if (!strcmp(key, "enemies_stomped")) S.stompsTotal = (int)v;
+        else if (!strcmp(key, "distance_total")) S.distanceTotal = v;
+        else if (!strcmp(key, "play_seconds")) S.playSeconds = v;
+    }
+    fclose(f);
+}
+
+static void writeSave(void) {
+    if (G.noSave || !savePath[0]) return;
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.tmp", savePath);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { fprintf(stderr, "could not write save file %s\n", savePath); return; }
+    char date[32] = "";
+    time_t now = time(NULL);
+    strftime(date, sizeof date, "%Y-%m-%d %H:%M", localtime(&now));
+    fprintf(f, "# ds3-jumper save file\n");
+    fprintf(f, "best_score = %d\n", S.best);
+    fprintf(f, "last_score = %d\n", S.last);
+    fprintf(f, "games_played = %d\n", S.games);
+    fprintf(f, "coins_total = %d\n", S.coinsTotal);
+    fprintf(f, "best_coins = %d\n", S.bestCoins);
+    fprintf(f, "enemies_stomped = %d\n", S.stompsTotal);
+    fprintf(f, "distance_total = %.0f\n", S.distanceTotal);
+    fprintf(f, "play_seconds = %.0f\n", S.playSeconds);
+    fprintf(f, "last_played = %s\n", date);
+    fclose(f);
+    rename(tmp, savePath); /* atomic replace */
+}
+
+/* Record the current run (game over, restart or quit) and save. */
+static void endRun(void) {
+    if (!G.runActive) return;
+    G.runActive = false;
+    if (G.score <= 0 && G.runSeconds < 1) return; /* never really played */
+    S.games++;
+    S.last = G.score;
+    if (G.score > S.best) S.best = G.score;
+    S.coinsTotal += G.coins;
+    if (G.coins > S.bestCoins) S.bestCoins = G.coins;
+    S.stompsTotal += G.stomps;
+    S.distanceTotal += G.dist;
+    S.playSeconds += G.runSeconds;
+    G.best = S.best;
+    writeSave();
+}
+
 /* --------------------------------------------------------------- game */
 
 static void newGame(void) {
+    endRun();
     G.nSolids = G.nCoins = G.nEnemies = G.nParts = 0;
     G.rng = (SDL_GetTicks() * 2654435761u) | 1u;
     addSolid(-300, 420, 1300, VH + 300 - 420, true);
@@ -222,15 +304,16 @@ static void newGame(void) {
     G.coyote = G.jumpBuf = G.invuln = G.squash = 0;
     G.safeX = G.px; G.safeY = G.py;
     G.camX = 0; G.dist = 0;
-    G.lives = START_LIVES; G.coins = G.bonus = G.score = 0;
+    G.lives = START_LIVES; G.coins = G.bonus = G.score = G.stomps = 0;
     G.shake = 0;
+    G.runActive = true; G.runSeconds = 0;
     G.st = ST_PLAY;
     if (G.pad) SDL_GameControllerSetPlayerIndex(G.pad, 0);
 }
 
 static void gameOver(void) {
     G.st = ST_OVER;
-    if (G.score > G.best) G.best = G.score;
+    endRun();
 }
 
 static void hurt(void) {
@@ -323,6 +406,7 @@ static void update(float dt, const Input *in) {
             G.enemies[i] = G.enemies[--G.nEnemies]; i--;
             G.vy = in->jumpHeld ? -620 : -420;
             G.bonus += 50;
+            G.stomps++;
             rumble(0x6000, 0, 90);
         } else if (G.invuln <= 0) {
             G.vy = -380;
@@ -348,6 +432,7 @@ static void update(float dt, const Input *in) {
     while (G.genX < G.camX + VW + 400) genChunk();
     prune();
 
+    G.runSeconds += dt;
     G.dist = fmaxf(G.dist, G.px / 10);
     G.score = (int)G.dist + G.coins * 10 + G.bonus;
 }
@@ -663,7 +748,13 @@ static void render(void) {
         text("DS3 JUMPER", VW / 2, 110, 12, 255, 220, 80, true);
         text("A TINY PLATFORMER FOR THE PS3 CONTROLLER", VW / 2, 200, 3, 255, 255, 255, true);
         if (fmodf(G.time, 1.0f) < 0.65f)
-            text("PRESS CROSS OR SPACE TO START", VW / 2, 270, 4, 255, 255, 255, true);
+            text("PRESS CROSS OR SPACE TO START", VW / 2, 260, 4, 255, 255, 255, true);
+        if (S.games > 0) {
+            char buf[128];
+            snprintf(buf, sizeof buf, "BEST %d   LAST %d   GAMES %d   COINS %d   STOMPS %d",
+                     S.best, S.last, S.games, S.coinsTotal, S.stompsTotal);
+            text(buf, VW / 2, 306, 2, 255, 225, 120, true);
+        }
         drawControls(350);
         drawHUD();
         break;
@@ -718,6 +809,7 @@ static int screenshot(const char *path) {
         updateParticles(STEP);
         G.time += STEP;
     }
+    endRun();
     render();
     SDL_RenderPresent(G.ren);
     int rc = SDL_SaveBMP(surf, path);
@@ -726,18 +818,35 @@ static int screenshot(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    bool windowed = false;
+    bool windowed = false, stats = false;
     const char *shot = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--windowed") || !strcmp(argv[i], "-w")) windowed = true;
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
+        else if (!strcmp(argv[i], "--stats")) stats = true;
         else {
-            printf("usage: %s [--windowed] [--screenshot out.bmp]\n", argv[0]);
+            printf("usage: %s [--windowed] [--stats] [--screenshot out.bmp]\n", argv[0]);
             return !strcmp(argv[i], "--help") || !strcmp(argv[i], "-h") ? 0 : 2;
         }
     }
 
+    initSavePath();
+    loadSave();
+    G.best = S.best;
+
+    if (stats) {
+        printf("save file: %s\n\n", savePath[0] ? savePath : "(unavailable)");
+        FILE *f = savePath[0] ? fopen(savePath, "r") : NULL;
+        if (!f) { printf("no saved games yet - play one first!\n"); return 0; }
+        char line[256];
+        while (fgets(line, sizeof line, f)) fputs(line, stdout);
+        fclose(f);
+        return 0;
+    }
+
     if (shot) {
+        /* Don't touch the real save unless a test file is given explicitly. */
+        G.noSave = !getenv("DS3_JUMPER_SAVE");
         if (SDL_Init(0) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
         int rc = screenshot(shot);
         SDL_Quit();
@@ -838,6 +947,7 @@ int main(int argc, char **argv) {
         SDL_RenderPresent(G.ren);
     }
 
+    endRun(); /* save a run that was in progress when quitting */
     if (G.pad) SDL_GameControllerClose(G.pad);
     SDL_DestroyRenderer(G.ren);
     SDL_DestroyWindow(G.win);

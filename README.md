@@ -27,10 +27,39 @@ brew install sdl2
 Then:
 
 ```sh
-make
-./ds3-jumper            # fullscreen
-./ds3-jumper --windowed # in a window
+make start      # build and play (fullscreen)
+make windowed   # build and play in a window
+make stats      # show your saved stats
 ```
+
+Or run the binary directly: `./ds3-jumper [--windowed] [--stats]`.
+
+## Saved stats
+
+After every game (game over, restart, or quitting mid-run) your stats are saved
+to a plain text file:
+
+| OS | Save file |
+|---|---|
+| Linux / BSD | `~/.local/share/danidomi/ds3-jumper/save.txt` |
+| macOS | `~/Library/Application Support/danidomi/ds3-jumper/save.txt` |
+
+Set `DS3_JUMPER_SAVE=/some/file.txt` to use a different file. It looks like:
+
+```ini
+# ds3-jumper save file
+best_score = 1520
+last_score = 830
+games_played = 12
+coins_total = 214
+best_coins = 41
+enemies_stomped = 37
+distance_total = 9450
+play_seconds = 1260
+last_played = 2026-11-24 15:55
+```
+
+Your best score and totals are shown on the title screen. Delete the file to reset.
 
 ## Controls
 
@@ -60,6 +89,7 @@ make
 
 ```sh
 make                                # build
+make start                          # build and play
 ./ds3-jumper --screenshot shot.bmp  # headless: simulate 4 s of play, save a frame
 make clean
 ```

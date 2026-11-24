@@ -13,10 +13,18 @@ all: $(BIN)
 $(BIN): src/main.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
-run: $(BIN)
+start: $(BIN)
 	./$(BIN)
+
+run: start
+
+windowed: $(BIN)
+	./$(BIN) --windowed
+
+stats: $(BIN)
+	@./$(BIN) --stats
 
 clean:
 	rm -f $(BIN) *.bmp
 
-.PHONY: all run clean
+.PHONY: all start run windowed stats clean
