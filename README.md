@@ -35,6 +35,17 @@ make stats      # show your saved stats
 
 Or run the binary directly: `./ds3-jumper [--windowed] [--stats]`.
 
+## Settings
+
+**SETTINGS** on the title screen or the pause menu: character colours (hair,
+skin, shirt, pants, scarf), sound effects, music, volume, rumble and an
+**FPS limit** of 30, 60, 90 or 120 (default 60). Everything is saved to
+`settings.txt` next to the save file (see below), e.g. `fps = 90`.
+
+The game can't show more frames than your screen refreshes: on a 60 Hz monitor
+90 and 120 still look like 60 (the settings screen tells you). The physics always
+runs at a fixed 120 steps per second, so the game plays the same at every limit.
+
 ## Saved stats
 
 After every game (game over, restart, or quitting mid-run) your stats are saved

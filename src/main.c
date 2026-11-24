@@ -89,7 +89,10 @@ static struct {
     int hair, skin, shirt, pants, scarf;
     bool sfx, music, rumble;
     int volume; /* 0..10 */
-} CFG = { 0, 0, 0, 0, 0, true, true, true, 7 };
+    int fps;    /* index into FPS_OPTIONS */
+} CFG = { 0, 0, 0, 0, 0, true, true, true, 7, 1 };
+
+static const int FPS_OPTIONS[] = { 30, 60, 90, 120 };
 
 static char savePath[1024], settingsPath[1024];
 
@@ -183,6 +186,10 @@ static void loadSettings(void) {
         else if (!strcmp(key, "music")) CFG.music = on;
         else if (!strcmp(key, "rumble")) CFG.rumble = on;
         else if (!strcmp(key, "volume")) CFG.volume = (int)clampf((float)atoi(val), 0, 10);
+        else if (!strcmp(key, "fps")) {
+            for (int i = 0; i < (int)LEN(FPS_OPTIONS); i++)
+                if (FPS_OPTIONS[i] == atoi(val)) CFG.fps = i;
+        }
     }
     fclose(f);
 }
@@ -201,6 +208,7 @@ static void writeSettings(void) {
     fprintf(f, "music = %s\n", CFG.music ? "on" : "off");
     fprintf(f, "volume = %d\n", CFG.volume);
     fprintf(f, "rumble = %s\n", CFG.rumble ? "on" : "off");
+    fprintf(f, "fps = %d\n", FPS_OPTIONS[CFG.fps]);
     fclose(f);
 }
 
@@ -910,9 +918,9 @@ static const char *const TITLE_MENU[] = { "START", "SETTINGS", "QUIT" };
 static const char *const PAUSE_MENU[] = { "RESUME", "RESTART", "SETTINGS", "MAIN MENU", "QUIT GAME" };
 
 enum { SET_HAIR, SET_SKIN, SET_SHIRT, SET_PANTS, SET_SCARF, SET_SFX, SET_MUSIC, SET_VOLUME,
-       SET_RUMBLE, SET_BACK, SET_COUNT };
+       SET_RUMBLE, SET_FPS, SET_BACK, SET_COUNT };
 static const char *const SETTING_NAMES[SET_COUNT] = {
-    "HAIR", "SKIN", "SHIRT", "PANTS", "SCARF", "SOUND EFFECTS", "MUSIC", "VOLUME", "RUMBLE", "BACK",
+    "HAIR", "SKIN", "SHIRT", "PANTS", "SCARF", "SOUND EFFECTS", "MUSIC", "VOLUME", "RUMBLE", "FPS LIMIT", "BACK",
 };
 
 static const Swatch *settingSwatch(int i) {
@@ -930,7 +938,7 @@ static void drawSettings(void) {
     overlay(190);
     text("SETTINGS", VW / 2, 28, 7, 255, 220, 80, true);
 
-    float y0 = 92, dy = 36;
+    float y0 = 88, dy = 33;
     for (int i = 0; i < SET_COUNT; i++) {
         float y = y0 + i * dy + (i == SET_BACK ? 10 : 0);
         bool sel = i == G.settingsSel;
@@ -944,6 +952,7 @@ static void drawSettings(void) {
         else if (i == SET_SFX) snprintf(val, sizeof val, "%s", CFG.sfx ? "ON" : "OFF");
         else if (i == SET_MUSIC) snprintf(val, sizeof val, "%s", CFG.music ? "ON" : "OFF");
         else if (i == SET_RUMBLE) snprintf(val, sizeof val, "%s", CFG.rumble ? "ON" : "OFF");
+        else if (i == SET_FPS) snprintf(val, sizeof val, "%d", FPS_OPTIONS[CFG.fps]);
         else snprintf(val, sizeof val, "%d%%", CFG.volume * 10);
         char shown[48];
         snprintf(shown, sizeof shown, sel ? "< %s >" : "%s", val);
@@ -951,6 +960,15 @@ static void drawSettings(void) {
         if (sw && strcmp(sw->name, "NONE")) {
             color(20, 24, 40, 255); fillS(588, y - 2, 22, 19);
             colorS(sw); fillS(590, y, 18, 15);
+        }
+        if (i == SET_FPS) {
+            SDL_DisplayMode m;
+            int hz = SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(G.win), &m) == 0 ? m.refresh_rate : 0;
+            if (hz > 0 && FPS_OPTIONS[CFG.fps] > hz) {
+                char note[48];
+                snprintf(note, sizeof note, "THIS SCREEN SHOWS MAX %d", hz);
+                text(note, 470, y + 19, 1, 255, 170, 90, true);
+            }
         }
         if (i == SET_VOLUME) {
             for (int k = 0; k < 10; k++) {
@@ -1097,6 +1115,7 @@ static void updateSettings(const Input *in) {
             CFG.rumble = !CFG.rumble;
             rumble(0x6000, 0x6000, 200); /* feel it when turned on */
             break;
+        case SET_FPS: CFG.fps = cycle(CFG.fps, LEN(FPS_OPTIONS), d); break;
         default: break;
         }
         if (G.settingsSel != SET_BACK) {
@@ -1113,6 +1132,22 @@ static void updateSettings(const Input *in) {
 }
 
 /* ----------------------------------------------------------------- main */
+
+/* Wait until the next frame is due for the chosen FPS limit. Sleeps most of
+ * the wait and spins the last ~1.5 ms, since SDL_Delay is only ms-accurate. */
+static void limitFrame(Uint64 *next) {
+    const Uint64 freq = SDL_GetPerformanceFrequency();
+    const Uint64 period = freq / (Uint64)FPS_OPTIONS[CFG.fps];
+    *next += period;
+    Uint64 now = SDL_GetPerformanceCounter();
+    if (now >= *next) {                    /* running late: don't try to catch up */
+        if (now - *next > period) *next = now;
+        return;
+    }
+    Uint64 spin = freq * 3 / 2000;
+    if (*next - now > spin) SDL_Delay((Uint32)((*next - now - spin) * 1000 / freq));
+    while (SDL_GetPerformanceCounter() < *next) {}
+}
 
 static void setFullscreen(bool on) {
     G.fullscreen = on;
@@ -1210,7 +1245,7 @@ int main(int argc, char **argv) {
     G.win = SDL_CreateWindow("DS3 Jumper", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                              VW, VH, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!G.win) { fprintf(stderr, "window: %s\n", SDL_GetError()); return 1; }
-    G.ren = SDL_CreateRenderer(G.win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    G.ren = SDL_CreateRenderer(G.win, -1, SDL_RENDERER_ACCELERATED); /* paced by the FPS limit */
     if (!G.ren) G.ren = SDL_CreateRenderer(G.win, -1, 0);
     if (!G.ren) { fprintf(stderr, "renderer: %s\n", SDL_GetError()); return 1; }
     SDL_RenderSetLogicalSize(G.ren, VW, VH);
@@ -1228,6 +1263,7 @@ int main(int argc, char **argv) {
     toTitle();
 
     Uint64 last = SDL_GetPerformanceCounter();
+    Uint64 nextFrame = last;
     float acc = 0;
     Input in;
 
@@ -1340,6 +1376,7 @@ int main(int argc, char **argv) {
         render();
         G.drawAcc += (float)(SDL_GetPerformanceCounter() - r0) * 1000 / (float)SDL_GetPerformanceFrequency();
         SDL_RenderPresent(G.ren);
+        limitFrame(&nextFrame);
     }
 
     endRun(); /* save a run that was in progress when quitting */
