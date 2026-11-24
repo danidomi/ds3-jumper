@@ -8,6 +8,7 @@ Written in C99 with SDL2 — runs on **Linux, macOS and other Unix systems**.
 Run, jump over gaps, grab coins and stomp enemies in an endless, procedurally
 generated world that gets harder the further you go. The controller rumbles when
 you get hit, grab coins or stomp enemies, and LED 1 lights up (no more blinking).
+Retro sound effects and an original chiptune soundtrack are synthesized in code.
 
 ## Build & run
 
@@ -73,6 +74,22 @@ Your best score and totals are shown on the title screen. Delete the file to res
 | △ Triangle | F / F11 | Toggle fullscreen |
 | PS | Q | Pause / quit (from menus) |
 
+In menus: **D-pad / stick** to choose, **✕** (Enter / Space) to confirm,
+**○** (Esc / Backspace) to go back.
+
+## Settings
+
+Open **Settings** from the title screen or the pause menu.
+
+![settings](docs/settings.png)
+
+- **Character:** hair, skin, shirt, pants and scarf colors, with a live preview
+- **Sound effects** on/off, **music** on/off, **volume** 0–100%
+- **Rumble** on/off
+
+Settings are saved to `settings.txt` next to the save file (see below), which you
+can also edit by hand. Override its location with `DS3_JUMPER_SETTINGS=/some/file.txt`.
+
 ## Controller notes
 
 - **macOS:** plug the DS3 in with a USB cable. macOS has no DS3 driver, but SDL's
@@ -91,8 +108,9 @@ Your best score and totals are shown on the title screen. Delete the file to res
 make                                # build
 make start                          # build and play
 ./ds3-jumper --screenshot shot.bmp  # headless: simulate 4 s of play, save a frame
+./ds3-jumper --screenshot s.bmp --screen settings   # title | play | pause | settings | over
 make clean
 ```
 
-Everything is drawn with code (rectangles and a built-in 3×5 pixel font) — no
-image or font assets.
+Everything is drawn with code (rectangles and a built-in 3×5 pixel font) and all
+sound is synthesized (`src/audio.c`) — no image, font or audio assets.

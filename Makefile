@@ -10,8 +10,11 @@ BIN := ds3-jumper
 
 all: $(BIN)
 
-$(BIN): src/main.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
+SRC := src/main.c src/audio.c
+HDR := src/audio.h
+
+$(BIN): $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(LDLIBS)
 
 start: $(BIN)
 	./$(BIN)

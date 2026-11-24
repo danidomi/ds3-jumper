@@ -11,6 +11,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "audio.h"
+
 #define VW 960 /* logical screen size; scaled to the window */
 #define VH 540
 #define STEP (1.0f / 120.0f)
@@ -31,29 +33,74 @@
 #define MAX_ENEMIES 64
 #define MAX_PARTS 512
 
+#define LEN(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
 typedef struct { float x, y, w, h; bool ground; } Solid;
 typedef struct { float x, y; } Coin;
 typedef struct { float x, y, vx, minx, maxx; } Enemy;
 typedef struct { float x, y, vx, vy, life, max, size; Uint8 r, g, b; } Part;
 
-typedef enum { ST_TITLE, ST_PLAY, ST_PAUSE, ST_OVER } State;
+typedef enum { ST_TITLE, ST_PLAY, ST_PAUSE, ST_OVER, ST_SETTINGS } State;
 
 typedef struct {
-    bool jump, run, start, select, tri, ps;
+    bool jump, run, start, select, tri, ps, confirm, back;
+    bool up, down, left, right;
 } Held;
 
 typedef struct {
     float move;
     bool jumpHeld, runHeld;
-    bool jumpP, startP, selectP, triP, psP;
+    bool jumpP, startP, selectP, triP, psP, confirmP, backP;
+    bool upP, downP, leftP, rightP; /* with auto-repeat, for menus */
 } Input;
+
+/* ------------------------------------------------------------- palettes */
+
+typedef struct { const char *name; Uint8 r, g, b; } Swatch;
+
+static const Swatch HAIR[] = {
+    { "BROWN", 90, 55, 30 }, { "BLACK", 30, 30, 36 }, { "BLONDE", 240, 205, 95 },
+    { "RED", 200, 70, 35 }, { "WHITE", 235, 235, 240 }, { "BLUE", 60, 115, 235 },
+    { "PINK", 245, 115, 185 }, { "GREEN", 70, 185, 95 }, { "PURPLE", 140, 80, 200 },
+};
+static const Swatch SKIN[] = {
+    { "LIGHT", 250, 214, 176 }, { "PALE", 255, 230, 210 }, { "TAN", 222, 172, 122 },
+    { "BROWN", 172, 116, 76 }, { "DARK", 112, 72, 46 },
+};
+static const Swatch SHIRT[] = {
+    { "RED", 220, 60, 60 }, { "BLUE", 60, 110, 220 }, { "GREEN", 60, 170, 80 },
+    { "PURPLE", 140, 70, 190 }, { "ORANGE", 240, 140, 40 }, { "TEAL", 40, 170, 170 },
+    { "BLACK", 45, 45, 55 }, { "WHITE", 235, 235, 240 },
+};
+static const Swatch PANTS[] = {
+    { "BLUE", 40, 60, 120 }, { "BLACK", 30, 30, 36 }, { "BROWN", 100, 70, 45 },
+    { "GREY", 110, 115, 125 }, { "GREEN", 50, 100, 60 }, { "RED", 140, 40, 40 },
+};
+static const Swatch SCARF[] = {
+    { "YELLOW", 255, 205, 60 }, { "RED", 230, 50, 60 }, { "BLUE", 70, 140, 255 },
+    { "GREEN", 80, 210, 100 }, { "PINK", 255, 130, 200 }, { "WHITE", 245, 245, 250 },
+    { "NONE", 0, 0, 0 },
+};
+
+/* ------------------------------------------------------------- settings */
+
+static struct {
+    int hair, skin, shirt, pants, scarf;
+    bool sfx, music, rumble;
+    int volume; /* 0..10 */
+} CFG = { 0, 0, 0, 0, 0, true, true, true, 7 };
+
+static char savePath[1024], settingsPath[1024];
+
+/* -------------------------------------------------------------- game state */
 
 static struct {
     SDL_Window *win;
     SDL_Renderer *ren;
     SDL_GameController *pad;
     bool fullscreen, quit;
-    State st;
+    State st, settingsReturn;
+    int menuSel, settingsSel;
 
     float px, py, vx, vy;
     bool onGround;
@@ -74,6 +121,7 @@ static struct {
     float genX, genY;
     Uint32 rng;
     Held prev;
+    float repeat[4];
 } G;
 
 /* ------------------------------------------------------------------ utils */
@@ -96,7 +144,133 @@ static bool overlap(float ax, float ay, float aw, float ah, float bx, float by, 
 }
 
 static void rumble(Uint16 lo, Uint16 hi, Uint32 ms) {
-    if (G.pad) SDL_GameControllerRumble(G.pad, lo, hi, ms);
+    if (G.pad && CFG.rumble) SDL_GameControllerRumble(G.pad, lo, hi, ms);
+}
+
+static void applyAudioConfig(void) { audio_config(CFG.sfx, CFG.music, CFG.volume); }
+
+/* ------------------------------------------------------- settings file */
+
+static int findSwatch(const Swatch *list, int n, const char *name) {
+    for (int i = 0; i < n; i++)
+        if (!strcmp(list[i].name, name)) return i;
+    return 0;
+}
+
+static void loadSettings(void) {
+    FILE *f = settingsPath[0] ? fopen(settingsPath, "r") : NULL;
+    if (!f) return;
+    char line[256], key[64], val[64];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || sscanf(line, " %63[^= ] = %63s", key, val) != 2) continue;
+        for (char *c = val; *c; c++) *c = (char)toupper((unsigned char)*c);
+        bool on = !strcmp(val, "ON") || !strcmp(val, "TRUE") || !strcmp(val, "1");
+        if (!strcmp(key, "hair")) CFG.hair = findSwatch(HAIR, LEN(HAIR), val);
+        else if (!strcmp(key, "skin")) CFG.skin = findSwatch(SKIN, LEN(SKIN), val);
+        else if (!strcmp(key, "shirt")) CFG.shirt = findSwatch(SHIRT, LEN(SHIRT), val);
+        else if (!strcmp(key, "pants")) CFG.pants = findSwatch(PANTS, LEN(PANTS), val);
+        else if (!strcmp(key, "scarf")) CFG.scarf = findSwatch(SCARF, LEN(SCARF), val);
+        else if (!strcmp(key, "sound_effects")) CFG.sfx = on;
+        else if (!strcmp(key, "music")) CFG.music = on;
+        else if (!strcmp(key, "rumble")) CFG.rumble = on;
+        else if (!strcmp(key, "volume")) CFG.volume = (int)clampf((float)atoi(val), 0, 10);
+    }
+    fclose(f);
+}
+
+static void writeSettings(void) {
+    if (G.noSave || !settingsPath[0]) return;
+    FILE *f = fopen(settingsPath, "w");
+    if (!f) { fprintf(stderr, "could not write settings file %s\n", settingsPath); return; }
+    fprintf(f, "# ds3-jumper settings (also editable in the game: Settings menu)\n");
+    fprintf(f, "hair = %s\n", HAIR[CFG.hair].name);
+    fprintf(f, "skin = %s\n", SKIN[CFG.skin].name);
+    fprintf(f, "shirt = %s\n", SHIRT[CFG.shirt].name);
+    fprintf(f, "pants = %s\n", PANTS[CFG.pants].name);
+    fprintf(f, "scarf = %s\n", SCARF[CFG.scarf].name);
+    fprintf(f, "sound_effects = %s\n", CFG.sfx ? "on" : "off");
+    fprintf(f, "music = %s\n", CFG.music ? "on" : "off");
+    fprintf(f, "volume = %d\n", CFG.volume);
+    fprintf(f, "rumble = %s\n", CFG.rumble ? "on" : "off");
+    fclose(f);
+}
+
+/* ------------------------------------------------------------ save file */
+
+/* Plain "key=value" text file in the per-user data directory. */
+static struct {
+    int best, last, games, coinsTotal, bestCoins, stompsTotal;
+    double distanceTotal, playSeconds;
+} S;
+
+static void initPaths(void) {
+    char *dir = SDL_GetPrefPath("danidomi", "ds3-jumper"); /* creates the folder */
+    const char *env = getenv("DS3_JUMPER_SAVE");
+    if (env && *env) snprintf(savePath, sizeof savePath, "%s", env);
+    else if (dir) snprintf(savePath, sizeof savePath, "%ssave.txt", dir);
+    env = getenv("DS3_JUMPER_SETTINGS");
+    if (env && *env) snprintf(settingsPath, sizeof settingsPath, "%s", env);
+    else if (dir) snprintf(settingsPath, sizeof settingsPath, "%ssettings.txt", dir);
+    if (dir) SDL_free(dir);
+}
+
+static void loadSave(void) {
+    FILE *f = savePath[0] ? fopen(savePath, "r") : NULL;
+    if (!f) return;
+    char line[256], key[64];
+    double v;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || sscanf(line, " %63[^= ] = %lf", key, &v) != 2) continue;
+        if (!strcmp(key, "best_score")) S.best = (int)v;
+        else if (!strcmp(key, "last_score")) S.last = (int)v;
+        else if (!strcmp(key, "games_played")) S.games = (int)v;
+        else if (!strcmp(key, "coins_total")) S.coinsTotal = (int)v;
+        else if (!strcmp(key, "best_coins")) S.bestCoins = (int)v;
+        else if (!strcmp(key, "enemies_stomped")) S.stompsTotal = (int)v;
+        else if (!strcmp(key, "distance_total")) S.distanceTotal = v;
+        else if (!strcmp(key, "play_seconds")) S.playSeconds = v;
+    }
+    fclose(f);
+}
+
+static void writeSave(void) {
+    if (G.noSave || !savePath[0]) return;
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.tmp", savePath);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { fprintf(stderr, "could not write save file %s\n", savePath); return; }
+    char date[32] = "";
+    time_t now = time(NULL);
+    strftime(date, sizeof date, "%Y-%m-%d %H:%M", localtime(&now));
+    fprintf(f, "# ds3-jumper save file\n");
+    fprintf(f, "best_score = %d\n", S.best);
+    fprintf(f, "last_score = %d\n", S.last);
+    fprintf(f, "games_played = %d\n", S.games);
+    fprintf(f, "coins_total = %d\n", S.coinsTotal);
+    fprintf(f, "best_coins = %d\n", S.bestCoins);
+    fprintf(f, "enemies_stomped = %d\n", S.stompsTotal);
+    fprintf(f, "distance_total = %.0f\n", S.distanceTotal);
+    fprintf(f, "play_seconds = %.0f\n", S.playSeconds);
+    fprintf(f, "last_played = %s\n", date);
+    fclose(f);
+    rename(tmp, savePath); /* atomic replace */
+}
+
+/* Record the current run (game over, restart or quit) and save. */
+static void endRun(void) {
+    if (!G.runActive) return;
+    G.runActive = false;
+    if (G.score <= 0 && G.runSeconds < 1) return; /* never really played */
+    S.games++;
+    S.last = G.score;
+    if (G.score > S.best) S.best = G.score;
+    S.coinsTotal += G.coins;
+    if (G.coins > S.bestCoins) S.bestCoins = G.coins;
+    S.stompsTotal += G.stomps;
+    S.distanceTotal += G.dist;
+    S.playSeconds += G.runSeconds;
+    G.best = S.best;
+    writeSave();
 }
 
 /* -------------------------------------------------------------- particles */
@@ -213,88 +387,9 @@ static void prune(void) {
     G.nEnemies = j;
 }
 
-/* ------------------------------------------------------------ save file */
-
-/* Plain "key=value" text file in the per-user data directory. */
-static struct {
-    int best, last, games, coinsTotal, bestCoins, stompsTotal;
-    double distanceTotal, playSeconds;
-} S;
-static char savePath[1024];
-
-static void initSavePath(void) {
-    const char *env = getenv("DS3_JUMPER_SAVE");
-    if (env && *env) { snprintf(savePath, sizeof savePath, "%s", env); return; }
-    char *dir = SDL_GetPrefPath("danidomi", "ds3-jumper"); /* creates the folder */
-    if (dir) {
-        snprintf(savePath, sizeof savePath, "%ssave.txt", dir);
-        SDL_free(dir);
-    }
-}
-
-static void loadSave(void) {
-    FILE *f = savePath[0] ? fopen(savePath, "r") : NULL;
-    if (!f) return;
-    char line[256], key[64];
-    double v;
-    while (fgets(line, sizeof line, f)) {
-        if (line[0] == '#' || sscanf(line, " %63[^= ] = %lf", key, &v) != 2) continue;
-        if (!strcmp(key, "best_score")) S.best = (int)v;
-        else if (!strcmp(key, "last_score")) S.last = (int)v;
-        else if (!strcmp(key, "games_played")) S.games = (int)v;
-        else if (!strcmp(key, "coins_total")) S.coinsTotal = (int)v;
-        else if (!strcmp(key, "best_coins")) S.bestCoins = (int)v;
-        else if (!strcmp(key, "enemies_stomped")) S.stompsTotal = (int)v;
-        else if (!strcmp(key, "distance_total")) S.distanceTotal = v;
-        else if (!strcmp(key, "play_seconds")) S.playSeconds = v;
-    }
-    fclose(f);
-}
-
-static void writeSave(void) {
-    if (G.noSave || !savePath[0]) return;
-    char tmp[1100];
-    snprintf(tmp, sizeof tmp, "%s.tmp", savePath);
-    FILE *f = fopen(tmp, "w");
-    if (!f) { fprintf(stderr, "could not write save file %s\n", savePath); return; }
-    char date[32] = "";
-    time_t now = time(NULL);
-    strftime(date, sizeof date, "%Y-%m-%d %H:%M", localtime(&now));
-    fprintf(f, "# ds3-jumper save file\n");
-    fprintf(f, "best_score = %d\n", S.best);
-    fprintf(f, "last_score = %d\n", S.last);
-    fprintf(f, "games_played = %d\n", S.games);
-    fprintf(f, "coins_total = %d\n", S.coinsTotal);
-    fprintf(f, "best_coins = %d\n", S.bestCoins);
-    fprintf(f, "enemies_stomped = %d\n", S.stompsTotal);
-    fprintf(f, "distance_total = %.0f\n", S.distanceTotal);
-    fprintf(f, "play_seconds = %.0f\n", S.playSeconds);
-    fprintf(f, "last_played = %s\n", date);
-    fclose(f);
-    rename(tmp, savePath); /* atomic replace */
-}
-
-/* Record the current run (game over, restart or quit) and save. */
-static void endRun(void) {
-    if (!G.runActive) return;
-    G.runActive = false;
-    if (G.score <= 0 && G.runSeconds < 1) return; /* never really played */
-    S.games++;
-    S.last = G.score;
-    if (G.score > S.best) S.best = G.score;
-    S.coinsTotal += G.coins;
-    if (G.coins > S.bestCoins) S.bestCoins = G.coins;
-    S.stompsTotal += G.stomps;
-    S.distanceTotal += G.dist;
-    S.playSeconds += G.runSeconds;
-    G.best = S.best;
-    writeSave();
-}
-
 /* --------------------------------------------------------------- game */
 
-static void newGame(void) {
-    endRun();
+static void resetWorld(void) {
     G.nSolids = G.nCoins = G.nEnemies = G.nParts = 0;
     G.rng = (SDL_GetTicks() * 2654435761u) | 1u;
     addSolid(-300, 420, 1300, VH + 300 - 420, true);
@@ -306,27 +401,46 @@ static void newGame(void) {
     G.camX = 0; G.dist = 0;
     G.lives = START_LIVES; G.coins = G.bonus = G.score = G.stomps = 0;
     G.shake = 0;
+    while (G.genX < G.camX + VW + 400) genChunk();
+}
+
+static void newGame(void) {
+    endRun();
+    resetWorld();
     G.runActive = true; G.runSeconds = 0;
     G.st = ST_PLAY;
     if (G.pad) SDL_GameControllerSetPlayerIndex(G.pad, 0);
+    audio_play(SFX_START);
+    audio_music(true);
+}
+
+static void toTitle(void) {
+    endRun();
+    resetWorld();
+    G.st = ST_TITLE;
+    G.menuSel = 0;
+    audio_music(true);
 }
 
 static void gameOver(void) {
     G.st = ST_OVER;
     endRun();
+    audio_music(false);
+    audio_play(SFX_GAMEOVER);
 }
 
-static void hurt(void) {
+static void hurt(bool fall) {
     G.lives--;
     G.shake = 0.3f;
     rumble(0xFFFF, 0xFFFF, 350);
+    audio_play(fall ? SFX_FALL : SFX_HURT);
     spawn(G.px + PW / 2, G.py + PH / 2, 24, 230, 70, 70, 260, 120);
     if (G.lives <= 0) { gameOver(); return; }
     G.invuln = 1.5f;
 }
 
 static void fell(void) {
-    hurt();
+    hurt(true);
     if (G.st != ST_PLAY) return;
     G.px = G.safeX; G.py = G.safeY - 40;
     G.vx = G.vy = 0;
@@ -351,6 +465,7 @@ static void update(float dt, const Input *in) {
         G.vy = -JUMP_V;
         G.jumpBuf = G.coyote = 0;
         G.onGround = false;
+        audio_play(SFX_JUMP);
         spawn(G.px + PW / 2, G.py + PH, 6, 230, 230, 220, 90, 0);
     }
     if (!in->jumpHeld && G.vy < -260) G.vy = -260;
@@ -369,6 +484,7 @@ static void update(float dt, const Input *in) {
     /* Move Y */
     float prevBottom = G.py + PH;
     bool wasGround = G.onGround;
+    float fallSpeed = G.vy;
     G.py += G.vy * dt;
     G.onGround = false;
     for (int i = 0; i < G.nSolids; i++) {
@@ -383,6 +499,7 @@ static void update(float dt, const Input *in) {
     }
     if (G.onGround && !wasGround) {
         G.squash = 1;
+        if (fallSpeed > 300) audio_play(SFX_LAND);
         spawn(G.px + PW / 2, G.py + PH, 8, 200, 190, 170, 110, 40);
     }
     if (G.onGround) { G.safeX = G.px; G.safeY = G.py; }
@@ -407,11 +524,12 @@ static void update(float dt, const Input *in) {
             G.vy = in->jumpHeld ? -620 : -420;
             G.bonus += 50;
             G.stomps++;
+            audio_play(SFX_STOMP);
             rumble(0x6000, 0, 90);
         } else if (G.invuln <= 0) {
             G.vy = -380;
             G.vx = (G.px < e->x) ? -250 : 250;
-            hurt();
+            hurt(false);
             if (G.st != ST_PLAY) return;
         }
     }
@@ -423,6 +541,7 @@ static void update(float dt, const Input *in) {
         spawn(c->x, c->y, 8, 255, 220, 70, 120, 60);
         G.coinArr[i] = G.coinArr[--G.nCoins]; i--;
         G.coins++;
+        audio_play(SFX_COIN);
         rumble(0, 0x8000, 40);
     }
 
@@ -447,26 +566,45 @@ static float axis(SDL_GameControllerAxis a) {
     return G.pad ? SDL_GameControllerGetAxis(G.pad, a) / 32767.0f : 0;
 }
 
-static void readInput(Input *in) {
+/* Edge + auto-repeat for menu navigation. */
+static bool navPress(bool held, bool wasHeld, int i, float dt) {
+    if (!held) { G.repeat[i] = 0; return false; }
+    if (!wasHeld) { G.repeat[i] = 0.35f; return true; }
+    G.repeat[i] -= dt;
+    if (G.repeat[i] <= 0) { G.repeat[i] = 0.11f; return true; }
+    return false;
+}
+
+static void readInput(Input *in, float dt) {
     const Uint8 *k = SDL_GetKeyboardState(NULL);
     Held h = { 0 };
     float mv = 0;
 
-    if (k[SDL_SCANCODE_LEFT] || k[SDL_SCANCODE_A]) mv -= 1;
-    if (k[SDL_SCANCODE_RIGHT] || k[SDL_SCANCODE_D]) mv += 1;
+    h.left = k[SDL_SCANCODE_LEFT] || k[SDL_SCANCODE_A];
+    h.right = k[SDL_SCANCODE_RIGHT] || k[SDL_SCANCODE_D];
+    h.up = k[SDL_SCANCODE_UP] || k[SDL_SCANCODE_W];
+    h.down = k[SDL_SCANCODE_DOWN] || k[SDL_SCANCODE_S];
     h.jump = k[SDL_SCANCODE_SPACE] || k[SDL_SCANCODE_UP] || k[SDL_SCANCODE_W] || k[SDL_SCANCODE_Z];
     h.run = k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT] || k[SDL_SCANCODE_X];
     h.start = k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_ESCAPE] || k[SDL_SCANCODE_P];
     h.select = k[SDL_SCANCODE_R];
     h.tri = k[SDL_SCANCODE_F] || k[SDL_SCANCODE_F11];
     h.ps = k[SDL_SCANCODE_Q];
+    h.confirm = k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_SPACE];
+    h.back = k[SDL_SCANCODE_ESCAPE] || k[SDL_SCANCODE_BACKSPACE];
 
     if (G.pad) {
-        float ax = axis(SDL_CONTROLLER_AXIS_LEFTX);
+        float ax = axis(SDL_CONTROLLER_AXIS_LEFTX), ay = axis(SDL_CONTROLLER_AXIS_LEFTY);
         if (fabsf(ax) > 0.2f) mv += (ax - copysignf(0.2f, ax)) / 0.8f;
+        h.left |= btn(SDL_CONTROLLER_BUTTON_DPAD_LEFT) || ax < -0.5f;
+        h.right |= btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || ax > 0.5f;
+        h.up |= btn(SDL_CONTROLLER_BUTTON_DPAD_UP) || ay < -0.5f;
+        h.down |= btn(SDL_CONTROLLER_BUTTON_DPAD_DOWN) || ay > 0.5f;
         if (btn(SDL_CONTROLLER_BUTTON_DPAD_LEFT)) mv -= 1;
         if (btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) mv += 1;
         h.jump |= btn(SDL_CONTROLLER_BUTTON_A);          /* Cross    */
+        h.confirm |= btn(SDL_CONTROLLER_BUTTON_A);
+        h.back |= btn(SDL_CONTROLLER_BUTTON_B);          /* Circle   */
         h.run |= btn(SDL_CONTROLLER_BUTTON_X)            /* Square   */
               || axis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 0.3f;
         h.start |= btn(SDL_CONTROLLER_BUTTON_START);
@@ -474,6 +612,8 @@ static void readInput(Input *in) {
         h.tri |= btn(SDL_CONTROLLER_BUTTON_Y);           /* Triangle */
         h.ps |= btn(SDL_CONTROLLER_BUTTON_GUIDE);        /* PS       */
     }
+    if (k[SDL_SCANCODE_LEFT] || k[SDL_SCANCODE_A]) mv -= 1;
+    if (k[SDL_SCANCODE_RIGHT] || k[SDL_SCANCODE_D]) mv += 1;
 
     in->move = clampf(mv, -1, 1);
     in->jumpHeld = h.jump;
@@ -483,6 +623,12 @@ static void readInput(Input *in) {
     in->selectP = h.select && !G.prev.select;
     in->triP = h.tri && !G.prev.tri;
     in->psP = h.ps && !G.prev.ps;
+    in->confirmP = h.confirm && !G.prev.confirm;
+    in->backP = h.back && !G.prev.back;
+    in->upP = navPress(h.up, G.prev.up, 0, dt);
+    in->downP = navPress(h.down, G.prev.down, 1, dt);
+    in->leftP = navPress(h.left, G.prev.left, 2, dt);
+    in->rightP = navPress(h.right, G.prev.right, 3, dt);
     G.prev = h;
 }
 
@@ -500,6 +646,7 @@ static void openPad(int index) {
 static float shakeX, shakeY;
 
 static void color(Uint8 r, Uint8 g, Uint8 b, Uint8 a) { SDL_SetRenderDrawColor(G.ren, r, g, b, a); }
+static void colorS(const Swatch *s) { color(s->r, s->g, s->b, 255); }
 
 static void fillS(float x, float y, float w, float h) { /* screen coords */
     SDL_FRect rc = { x, y, w, h };
@@ -535,6 +682,8 @@ static const char *glyph(char c) {
     case '.': return "000000000000010"; case '(': return "010100100100010";
     case ')': return "010001001001010"; case '+': return "000010111010000";
     case ',': return "000000000010100"; case '\'': return "010010000000000";
+    case '<': return "001010100010001"; case '>': return "100010001010100";
+    case '%': return "101001010100101";
     default: return NULL;
     }
 }
@@ -558,6 +707,35 @@ static void text(const char *s, float x, float y, float sc, Uint8 r, Uint8 g, Ui
     textRaw(s, x, y, sc);
 }
 
+/* The player character, drawn in screen coords at scale `sc`. */
+static void drawCharacter(float bx, float by, float sc, int facing, float squash, float step, float t) {
+    float sq = squash * 0.25f;
+    float w = PW * (1 + sq), h = PH * (1 - sq);
+    float x0 = bx - (w - PW) / 2 * sc, y0 = by + (PH - h) * sc;
+#define R(x, y, ww, hh) fillS(x0 + (x) * sc, y0 + (y) * sc, (ww) * sc, (hh) * sc)
+    colorS(&PANTS[CFG.pants]); /* legs */
+    R(3, h - 8 - fmaxf(0, step), 7, 8);
+    R(w - 10, h - 8 - fmaxf(0, -step), 7, 8);
+    colorS(&SHIRT[CFG.shirt]); /* body */
+    R(0, 10, w, h - 17);
+    color(255, 255, 255, 50);
+    R(2, 11, w - 4, 3);
+    colorS(&SKIN[CFG.skin]); /* head */
+    R(2, 0, w - 4, 12);
+    colorS(&HAIR[CFG.hair]);
+    R(1, -2, w - 2, 4);
+    R(facing > 0 ? 1 : w - 5, 0, 4, 5);
+    float ex = facing > 0 ? w - 9 : 4;
+    color(255, 255, 255, 255); R(ex, 3, 5, 5);
+    color(20, 20, 40, 255); R(ex + (facing > 0 ? 2 : 0), 4, 3, 3);
+    if (strcmp(SCARF[CFG.scarf].name, "NONE")) {
+        colorS(&SCARF[CFG.scarf]);
+        R(0, 10, w, 3);
+        R(facing > 0 ? -6 : w, 11 + sinf(t * 14) * 1.5f, 6, 3);
+    }
+#undef R
+}
+
 /* Piecewise ridge height for background layers. */
 static float ridge(float wx, float spacing, float lo, float hi, bool round, int seed) {
     float f = wx / spacing;
@@ -570,20 +748,15 @@ static float ridge(float wx, float spacing, float lo, float hi, bool round, int 
 }
 
 static void drawBackground(void) {
-    /* Sky gradient */
-    for (int i = 0; i < 27; i++) {
+    for (int i = 0; i < 27; i++) { /* sky gradient */
         float t = i / 26.0f;
         color((Uint8)(80 + 110 * t), (Uint8)(150 + 75 * t), (Uint8)(225 + 25 * t), 255);
         fillS(0, i * 20.0f, VW, 21);
     }
-    /* Sun */
-    color(255, 240, 190, 255);
-    fillS(760, 60, 60, 60);
-    color(255, 250, 220, 255);
-    fillS(770, 70, 40, 40);
+    color(255, 240, 190, 255); fillS(760, 60, 60, 60); /* sun */
+    color(255, 250, 220, 255); fillS(770, 70, 40, 40);
 
-    /* Clouds */
-    color(250, 252, 255, 255);
+    color(250, 252, 255, 255); /* clouds */
     float cx0 = G.camX * 0.1f;
     for (int i = (int)floorf(cx0 / 280) - 1; i < (int)floorf((cx0 + VW) / 280) + 2; i++) {
         float x = i * 280 - cx0 + hashf(i * 7) * 120;
@@ -594,20 +767,17 @@ static void drawBackground(void) {
         fillS(x + w * 0.45f, y + 4, w * 0.35f, 10);
     }
 
-    /* Far mountains (parallax 0.2) */
-    color(130, 155, 205, 255);
+    color(130, 155, 205, 255); /* far mountains */
     for (int sx = 0; sx < VW; sx += 3) {
         float h = ridge(sx + G.camX * 0.2f, 140, 140, 270, false, 11);
         fillS((float)sx, VH - h, 3, h);
     }
-    /* Snow caps */
-    color(235, 240, 250, 255);
+    color(235, 240, 250, 255); /* snow caps */
     for (int sx = 0; sx < VW; sx += 3) {
         float h = ridge(sx + G.camX * 0.2f, 140, 140, 270, false, 11);
         if (h > 235) fillS((float)sx, VH - h, 3, (h - 235) * 0.8f);
     }
-    /* Near hills (parallax 0.45) */
-    color(95, 170, 120, 255);
+    color(95, 170, 120, 255); /* near hills */
     for (int sx = 0; sx < VW; sx += 3) {
         float h = ridge(sx + G.camX * 0.45f, 220, 70, 160, true, 97);
         fillS((float)sx, VH - h, 3, h);
@@ -666,29 +836,10 @@ static void drawWorld(void) {
         fillW(e->x + 8 + d, e->y + 8, 3, 4); fillW(e->x + 17 + d, e->y + 8, 3, 4);
     }
 
-    /* Player */
     bool blink = G.invuln > 0 && fmodf(G.time, 0.16f) < 0.08f;
     if (G.st != ST_OVER && !blink) {
-        float sq = G.squash * 0.25f;
-        float w = PW * (1 + sq), h = PH * (1 - sq);
-        float x = G.px - (w - PW) / 2, y = G.py + (PH - h);
-        /* legs */
         float step = G.onGround && fabsf(G.vx) > 20 ? sinf(G.runAnim) * 4 : 0;
-        color(40, 60, 120, 255);
-        fillW(x + 3, y + h - 8 - fmaxf(0, step), 7, 8);
-        fillW(x + w - 10, y + h - 8 - fmaxf(0, -step), 7, 8);
-        /* body */
-        color(220, 60, 60, 255); fillW(x, y + 10, w, h - 17);
-        color(250, 110, 90, 255); fillW(x + 2, y + 11, w - 4, 3);
-        /* head */
-        color(250, 210, 170, 255); fillW(x + 2, y, w - 4, 12);
-        color(60, 40, 30, 255); fillW(x + 1, y - 2, w - 2, 4); /* hair */
-        float ex = G.facing > 0 ? x + w - 9 : x + 4;
-        color(255, 255, 255, 255); fillW(ex, y + 3, 5, 5);
-        color(20, 20, 40, 255); fillW(ex + (G.facing > 0 ? 2 : 0), y + 4, 3, 3);
-        /* scarf */
-        color(255, 205, 60, 255);
-        fillW(G.facing > 0 ? x - 6 : x + w, y + 11 + sinf(G.time * 14) * 1.5f, 6, 3);
+        drawCharacter(G.px - G.camX + shakeX, G.py + shakeY, 1, G.facing, G.squash, step, G.time);
     }
 
     for (int i = 0; i < G.nParts; i++) {
@@ -726,11 +877,85 @@ static void overlay(Uint8 a) {
     fillS(0, 0, VW, VH);
 }
 
-static void drawControls(float y) {
-    text("STICK / D-PAD  MOVE      CROSS  JUMP (HOLD = HIGHER)", VW / 2, y, 2, 230, 235, 255, true);
-    text("SQUARE / R2  RUN      START  PAUSE      SELECT  RESTART", VW / 2, y + 22, 2, 230, 235, 255, true);
-    text("TRIANGLE  FULLSCREEN      PS  QUIT", VW / 2, y + 44, 2, 230, 235, 255, true);
-    text("KEYBOARD: ARROWS  SPACE  SHIFT  ENTER  R  F  Q", VW / 2, y + 76, 2, 170, 180, 210, true);
+static void drawMenu(const char *const *items, int n, int sel, float y, float sc) {
+    for (int i = 0; i < n; i++) {
+        float yy = y + i * (sc * 5 + 14);
+        if (i == sel) {
+            char buf[64];
+            snprintf(buf, sizeof buf, "> %s <", items[i]);
+            text(buf, VW / 2, yy, sc, 255, 220, 80, true);
+        } else {
+            text(items[i], VW / 2, yy, sc, 220, 225, 245, true);
+        }
+    }
+}
+
+static void drawHint(const char *s) { text(s, VW / 2, VH - 30, 2, 170, 180, 210, true); }
+
+static const char *const TITLE_MENU[] = { "START", "SETTINGS", "QUIT" };
+static const char *const PAUSE_MENU[] = { "RESUME", "RESTART", "SETTINGS", "MAIN MENU", "QUIT GAME" };
+
+enum { SET_HAIR, SET_SKIN, SET_SHIRT, SET_PANTS, SET_SCARF, SET_SFX, SET_MUSIC, SET_VOLUME,
+       SET_RUMBLE, SET_BACK, SET_COUNT };
+static const char *const SETTING_NAMES[SET_COUNT] = {
+    "HAIR", "SKIN", "SHIRT", "PANTS", "SCARF", "SOUND EFFECTS", "MUSIC", "VOLUME", "RUMBLE", "BACK",
+};
+
+static const Swatch *settingSwatch(int i) {
+    switch (i) {
+    case SET_HAIR: return &HAIR[CFG.hair];
+    case SET_SKIN: return &SKIN[CFG.skin];
+    case SET_SHIRT: return &SHIRT[CFG.shirt];
+    case SET_PANTS: return &PANTS[CFG.pants];
+    case SET_SCARF: return &SCARF[CFG.scarf];
+    default: return NULL;
+    }
+}
+
+static void drawSettings(void) {
+    overlay(190);
+    text("SETTINGS", VW / 2, 28, 7, 255, 220, 80, true);
+
+    float y0 = 92, dy = 36;
+    for (int i = 0; i < SET_COUNT; i++) {
+        float y = y0 + i * dy + (i == SET_BACK ? 10 : 0);
+        bool sel = i == G.settingsSel;
+        Uint8 r = sel ? 255 : 220, g = sel ? 220 : 225, b = sel ? 80 : 245;
+        if (sel) { color(255, 255, 255, 30); fillS(70, y - 6, 560, 30); }
+        if (i == SET_BACK) { text(sel ? "> BACK <" : "BACK", 350, y, 3, r, g, b, true); continue; }
+        text(SETTING_NAMES[i], 90, y, 3, r, g, b, false);
+        char val[32];
+        const Swatch *sw = settingSwatch(i);
+        if (sw) snprintf(val, sizeof val, "%s", sw->name);
+        else if (i == SET_SFX) snprintf(val, sizeof val, "%s", CFG.sfx ? "ON" : "OFF");
+        else if (i == SET_MUSIC) snprintf(val, sizeof val, "%s", CFG.music ? "ON" : "OFF");
+        else if (i == SET_RUMBLE) snprintf(val, sizeof val, "%s", CFG.rumble ? "ON" : "OFF");
+        else snprintf(val, sizeof val, "%d%%", CFG.volume * 10);
+        char shown[48];
+        snprintf(shown, sizeof shown, sel ? "< %s >" : "%s", val);
+        text(shown, 470, y, 3, r, g, b, true);
+        if (sw && strcmp(sw->name, "NONE")) {
+            color(20, 24, 40, 255); fillS(588, y - 2, 22, 19);
+            colorS(sw); fillS(590, y, 18, 15);
+        }
+        if (i == SET_VOLUME) {
+            for (int k = 0; k < 10; k++) {
+                if (k < CFG.volume) color(120, 220, 120, 255); else color(70, 75, 95, 255);
+                fillS(540 + k * 9, y + 18, 7, 4);
+            }
+        }
+    }
+
+    /* Live character preview */
+    color(255, 255, 255, 25); fillS(680, 110, 220, 260);
+    color(80, 185, 75, 255); fillS(700, 330, 180, 12);
+    color(140, 95, 60, 255); fillS(700, 342, 180, 18);
+    int facing = fmodf(G.time, 4.0f) < 2.0f ? 1 : -1;
+    float bob = fabsf(sinf(G.time * 3)) * 14;
+    drawCharacter(790 - PW * 2.5f, 330 - PH * 5 - bob, 5, facing, 0, sinf(G.time * 8) * 3, G.time);
+    text("PREVIEW", 790, 380, 2, 200, 205, 230, true);
+
+    drawHint("UP/DOWN: CHOOSE    LEFT/RIGHT: CHANGE    CIRCLE / ESC: BACK");
 }
 
 static void render(void) {
@@ -745,18 +970,18 @@ static void render(void) {
     switch (G.st) {
     case ST_TITLE:
         overlay(140);
-        text("DS3 JUMPER", VW / 2, 110, 12, 255, 220, 80, true);
-        text("A TINY PLATFORMER FOR THE PS3 CONTROLLER", VW / 2, 200, 3, 255, 255, 255, true);
-        if (fmodf(G.time, 1.0f) < 0.65f)
-            text("PRESS CROSS OR SPACE TO START", VW / 2, 260, 4, 255, 255, 255, true);
+        text("DS3 JUMPER", VW / 2, 80, 12, 255, 220, 80, true);
+        text("A TINY PLATFORMER FOR THE PS3 CONTROLLER", VW / 2, 160, 3, 255, 255, 255, true);
+        drawMenu(TITLE_MENU, LEN(TITLE_MENU), G.menuSel, 230, 5);
         if (S.games > 0) {
             char buf[128];
             snprintf(buf, sizeof buf, "BEST %d   LAST %d   GAMES %d   COINS %d   STOMPS %d",
                      S.best, S.last, S.games, S.coinsTotal, S.stompsTotal);
-            text(buf, VW / 2, 306, 2, 255, 225, 120, true);
+            text(buf, VW / 2, 400, 2, 255, 225, 120, true);
         }
-        drawControls(350);
-        drawHUD();
+        text("STICK/D-PAD MOVE   CROSS JUMP   SQUARE/R2 RUN   START PAUSE   TRIANGLE FULLSCREEN",
+             VW / 2, 440, 2, 230, 235, 255, true);
+        drawHint("UP/DOWN: CHOOSE    CROSS / ENTER: OK");
         break;
     case ST_PLAY:
         drawHUD();
@@ -764,9 +989,9 @@ static void render(void) {
     case ST_PAUSE:
         drawHUD();
         overlay(150);
-        text("PAUSED", VW / 2, 150, 10, 255, 255, 255, true);
-        text("START: RESUME    SELECT: RESTART    PS: QUIT", VW / 2, 260, 3, 230, 235, 255, true);
-        drawControls(350);
+        text("PAUSED", VW / 2, 90, 10, 255, 255, 255, true);
+        drawMenu(PAUSE_MENU, LEN(PAUSE_MENU), G.menuSel, 200, 4);
+        drawHint("UP/DOWN: CHOOSE    CROSS: OK    START / CIRCLE: RESUME");
         break;
     case ST_OVER:
         drawHUD();
@@ -778,8 +1003,56 @@ static void render(void) {
             text(buf, VW / 2, 240, 4, 255, 255, 255, true);
         }
         if (fmodf(G.time, 1.0f) < 0.65f)
-            text("PRESS CROSS OR SPACE TO PLAY AGAIN", VW / 2, 300, 3, 255, 255, 255, true);
+            text("PRESS CROSS TO PLAY AGAIN", VW / 2, 300, 3, 255, 255, 255, true);
+        drawHint("CIRCLE / ESC: MAIN MENU");
         break;
+    case ST_SETTINGS:
+        drawSettings();
+        break;
+    }
+}
+
+/* ------------------------------------------------------------ menus */
+
+static void openSettings(State from) {
+    G.settingsReturn = from;
+    G.settingsSel = 0;
+    G.st = ST_SETTINGS;
+}
+
+static int cycle(int v, int n, int d) { return ((v + d) % n + n) % n; }
+
+static void updateSettings(const Input *in) {
+    if (in->upP) { G.settingsSel = cycle(G.settingsSel, SET_COUNT, -1); audio_play(SFX_MENU_MOVE); }
+    if (in->downP) { G.settingsSel = cycle(G.settingsSel, SET_COUNT, 1); audio_play(SFX_MENU_MOVE); }
+    int d = in->leftP ? -1 : in->rightP ? 1 : 0;
+    if (in->confirmP && G.settingsSel != SET_BACK) d = 1;
+    if (d) {
+        switch (G.settingsSel) {
+        case SET_HAIR: CFG.hair = cycle(CFG.hair, LEN(HAIR), d); break;
+        case SET_SKIN: CFG.skin = cycle(CFG.skin, LEN(SKIN), d); break;
+        case SET_SHIRT: CFG.shirt = cycle(CFG.shirt, LEN(SHIRT), d); break;
+        case SET_PANTS: CFG.pants = cycle(CFG.pants, LEN(PANTS), d); break;
+        case SET_SCARF: CFG.scarf = cycle(CFG.scarf, LEN(SCARF), d); break;
+        case SET_SFX: CFG.sfx = !CFG.sfx; break;
+        case SET_MUSIC: CFG.music = !CFG.music; break;
+        case SET_VOLUME: CFG.volume = (int)clampf((float)(CFG.volume + d), 0, 10); break;
+        case SET_RUMBLE:
+            CFG.rumble = !CFG.rumble;
+            rumble(0x6000, 0x6000, 200); /* feel it when turned on */
+            break;
+        default: break;
+        }
+        if (G.settingsSel != SET_BACK) {
+            applyAudioConfig();
+            audio_play(SFX_TOGGLE);
+            writeSettings();
+        }
+    }
+    if (in->backP || in->startP || (in->confirmP && G.settingsSel == SET_BACK)) {
+        writeSettings();
+        audio_play(SFX_MENU_BACK);
+        G.st = G.settingsReturn;
     }
 }
 
@@ -792,7 +1065,7 @@ static void setFullscreen(bool on) {
 }
 
 /* Headless: simulate a few seconds of scripted play and save a BMP. */
-static int screenshot(const char *path) {
+static int screenshot(const char *path, State view) {
     SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormat(0, VW, VH, 32, SDL_PIXELFORMAT_ARGB8888);
     if (!surf) { fprintf(stderr, "surface: %s\n", SDL_GetError()); return 1; }
     G.ren = SDL_CreateSoftwareRenderer(surf);
@@ -810,6 +1083,8 @@ static int screenshot(const char *path) {
         G.time += STEP;
     }
     endRun();
+    if (view == ST_SETTINGS) openSettings(ST_TITLE);
+    else if (view != ST_PLAY) G.st = view;
     render();
     SDL_RenderPresent(G.ren);
     int rc = SDL_SaveBMP(surf, path);
@@ -820,22 +1095,30 @@ static int screenshot(const char *path) {
 int main(int argc, char **argv) {
     bool windowed = false, stats = false;
     const char *shot = NULL;
+    State shotView = ST_PLAY;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--windowed") || !strcmp(argv[i], "-w")) windowed = true;
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
-        else if (!strcmp(argv[i], "--stats")) stats = true;
+        else if (!strcmp(argv[i], "--screen") && i + 1 < argc) {
+            const char *v = argv[++i];
+            shotView = !strcmp(v, "title") ? ST_TITLE : !strcmp(v, "pause") ? ST_PAUSE
+                     : !strcmp(v, "settings") ? ST_SETTINGS : !strcmp(v, "over") ? ST_OVER : ST_PLAY;
+        } else if (!strcmp(argv[i], "--stats")) stats = true;
         else {
-            printf("usage: %s [--windowed] [--stats] [--screenshot out.bmp]\n", argv[0]);
+            printf("usage: %s [--windowed] [--stats] [--screenshot out.bmp [--screen title|play|pause|settings|over]]\n",
+                   argv[0]);
             return !strcmp(argv[i], "--help") || !strcmp(argv[i], "-h") ? 0 : 2;
         }
     }
 
-    initSavePath();
+    initPaths();
     loadSave();
+    loadSettings();
     G.best = S.best;
 
     if (stats) {
-        printf("save file: %s\n\n", savePath[0] ? savePath : "(unavailable)");
+        printf("save file:     %s\nsettings file: %s\n\n", savePath[0] ? savePath : "(unavailable)",
+               settingsPath[0] ? settingsPath : "(unavailable)");
         FILE *f = savePath[0] ? fopen(savePath, "r") : NULL;
         if (!f) { printf("no saved games yet - play one first!\n"); return 0; }
         char line[256];
@@ -848,7 +1131,7 @@ int main(int argc, char **argv) {
         /* Don't touch the real save unless a test file is given explicitly. */
         G.noSave = !getenv("DS3_JUMPER_SAVE");
         if (SDL_Init(0) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
-        int rc = screenshot(shot);
+        int rc = screenshot(shot, shotView);
         SDL_Quit();
         return rc;
     }
@@ -864,6 +1147,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
+    if (!audio_init()) fprintf(stderr, "no audio device: %s (continuing without sound)\n", SDL_GetError());
+    applyAudioConfig();
 
     G.win = SDL_CreateWindow("DS3 Jumper", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                              VW, VH, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
@@ -877,8 +1162,7 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < SDL_NumJoysticks(); i++) openPad(i);
 
-    newGame();
-    G.st = ST_TITLE;
+    toTitle();
 
     Uint64 last = SDL_GetPerformanceCounter();
     float acc = 0;
@@ -896,7 +1180,7 @@ int main(int argc, char **argv) {
                     SDL_GameControllerClose(G.pad);
                     G.pad = NULL;
                     for (int i = 0; i < SDL_NumJoysticks(); i++) openPad(i);
-                    if (G.st == ST_PLAY) G.st = ST_PAUSE;
+                    if (G.st == ST_PLAY) { G.st = ST_PAUSE; G.menuSel = 0; }
                 }
                 break;
             }
@@ -907,16 +1191,26 @@ int main(int argc, char **argv) {
         last = now;
         if (dt > 0.05f) dt = 0.05f;
 
-        readInput(&in);
+        readInput(&in, dt);
         if (in.triP) setFullscreen(!G.fullscreen);
 
         switch (G.st) {
         case ST_TITLE:
-            if (in.jumpP || in.startP) newGame();
-            else if (in.psP) G.quit = true;
+            if (in.upP) { G.menuSel = cycle(G.menuSel, LEN(TITLE_MENU), -1); audio_play(SFX_MENU_MOVE); }
+            if (in.downP) { G.menuSel = cycle(G.menuSel, LEN(TITLE_MENU), 1); audio_play(SFX_MENU_MOVE); }
+            if (in.psP) G.quit = true;
+            else if (in.confirmP || in.startP) {
+                if (G.menuSel == 0) newGame();
+                else if (G.menuSel == 1) { audio_play(SFX_MENU_OK); openSettings(ST_TITLE); }
+                else G.quit = true;
+            }
             break;
         case ST_PLAY:
-            if (in.startP || in.psP) { G.st = ST_PAUSE; break; }
+            if (in.startP || in.psP) {
+                G.st = ST_PAUSE; G.menuSel = 0;
+                audio_play(SFX_MENU_OK);
+                break;
+            }
             if (in.selectP) { newGame(); break; }
             if (in.jumpP) G.jumpBuf = 0.12f;
             acc += dt;
@@ -927,17 +1221,33 @@ int main(int argc, char **argv) {
             break;
         case ST_PAUSE:
             acc = 0;
-            if (in.startP) G.st = ST_PLAY;
-            else if (in.selectP) newGame();
+            if (in.upP) { G.menuSel = cycle(G.menuSel, LEN(PAUSE_MENU), -1); audio_play(SFX_MENU_MOVE); }
+            if (in.downP) { G.menuSel = cycle(G.menuSel, LEN(PAUSE_MENU), 1); audio_play(SFX_MENU_MOVE); }
+            if (in.confirmP) {
+                switch (G.menuSel) {
+                case 0: G.st = ST_PLAY; audio_play(SFX_MENU_BACK); break;
+                case 1: newGame(); break;
+                case 2: audio_play(SFX_MENU_OK); openSettings(ST_PAUSE); break;
+                case 3: audio_play(SFX_MENU_BACK); toTitle(); break;
+                default: G.quit = true; break;
+                }
+            } else if (in.startP || in.backP) {
+                G.st = ST_PLAY;
+                audio_play(SFX_MENU_BACK);
+            } else if (in.selectP) newGame();
             else if (in.psP) G.quit = true;
             break;
         case ST_OVER:
-            if (in.jumpP || in.startP || in.selectP) newGame();
+            if (in.confirmP || in.startP || in.selectP) newGame();
+            else if (in.backP) { audio_play(SFX_MENU_BACK); toTitle(); }
             else if (in.psP) G.quit = true;
+            break;
+        case ST_SETTINGS:
+            updateSettings(&in);
             break;
         }
 
-        if (G.st != ST_PAUSE) updateParticles(dt);
+        if (G.st != ST_PAUSE && G.st != ST_SETTINGS) updateParticles(dt);
         G.time += dt;
         G.shake = fmaxf(0, G.shake - dt);
 
@@ -948,6 +1258,8 @@ int main(int argc, char **argv) {
     }
 
     endRun(); /* save a run that was in progress when quitting */
+    writeSettings();
+    audio_quit();
     if (G.pad) SDL_GameControllerClose(G.pad);
     SDL_DestroyRenderer(G.ren);
     SDL_DestroyWindow(G.win);
