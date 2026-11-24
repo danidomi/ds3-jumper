@@ -152,11 +152,11 @@ void audio_play(Sfx s) {
     SDL_LockAudioDevice(dev);
 #define V(w, f0, f1, d, vol, duty, delay) start(sfx, SFX_VOICES, w, f0, f1, d, vol, duty, delay)
     switch (s) {
-    case SFX_JUMP: V(W_SQUARE, 280, 720, 0.13f, 0.20f, 0.5f, 0); break;
+    case SFX_JUMP: V(W_SQUARE, 280, 720, 0.14f, 0.30f, 0.5f, 0); break;
     case SFX_LAND: V(W_NOISE, 1200, 300, 0.06f, 0.10f, 0.5f, 0); break;
     case SFX_COIN:
-        V(W_SQUARE, 988, 988, 0.07f, 0.16f, 0.5f, 0);
-        V(W_SQUARE, 1319, 1319, 0.20f, 0.16f, 0.5f, 0.065f);
+        V(W_SQUARE, 988, 988, 0.08f, 0.26f, 0.5f, 0);
+        V(W_SQUARE, 1319, 1319, 0.22f, 0.26f, 0.5f, 0.07f);
         break;
     case SFX_STOMP:
         V(W_SQUARE, 620, 140, 0.14f, 0.22f, 0.5f, 0);
