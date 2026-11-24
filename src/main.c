@@ -1592,7 +1592,10 @@ int main(int argc, char **argv) {
                 audio_play(SFX_TOGGLE);
                 writeSettings();
             } else if (in.psP) G.quit = true;
-            else if (in.confirmP || in.startP) {
+            else if (in.backP) { /* ESC/Circle: jump to QUIT, press again to quit */
+                if (G.menuSel == TITLE_ITEMS - 1) G.quit = true;
+                else { G.menuSel = TITLE_ITEMS - 1; audio_play(SFX_MENU_BACK); }
+            } else if (in.confirmP || in.startP) {
                 if (G.menuSel == 0) newGame();
                 else if (G.menuSel == 2) { audio_play(SFX_MENU_OK); openSettings(ST_TITLE); }
                 else G.quit = true;
