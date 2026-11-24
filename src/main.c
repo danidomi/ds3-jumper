@@ -41,6 +41,7 @@ typedef enum { EN_WALKER, EN_HOPPER, EN_FLYER, EN_SPIKY, EN_ARMORED, EN_KINDS } 
 typedef struct {
     EnemyKind kind;
     float x, y, vx, vy, minx, maxx;
+    float prevX, prevY; /* position at the previous physics step (for smooth drawing) */
     float baseY;  /* ground line (hopper) or flight centre (flyer) */
     float t;      /* per-enemy timer: hop countdown / flight phase */
     int hp;       /* armored: 2 = helmet on */
@@ -138,6 +139,8 @@ static struct {
     int facing;
     float safeX, safeY;
 
+    float prevPx, prevPy, prevCamX; /* previous physics step, for interpolation */
+    float scale, offX, offY;        /* logical -> device pixels */
     int lives, maxLives, coins, bonus, score, best, stomps;
     Difficulty runDiff; /* difficulty of the current run */
     bool runActive, noSave, newBest, playedThisSession, sessionNewBest;
@@ -425,6 +428,7 @@ static void addEnemy(EnemyKind k, float minx, float maxx, float groundY) {
     e.t = 0.6f + frand();
     e.hp = k == EN_ARMORED ? 2 : 1;
     if (k == EN_FLYER) { e.baseY = groundY - 95 - frand() * 25; e.y = e.baseY; e.t = frand() * 6.28f; }
+    e.prevX = e.x; e.prevY = e.y;
     G.enemies[G.nEnemies++] = e;
 }
 
@@ -514,6 +518,7 @@ static void resetWorld(void) {
     G.coyote = G.jumpBuf = G.invuln = G.squash = 0;
     G.safeX = G.px; G.safeY = G.py;
     G.camX = 0; G.dist = 0;
+    G.prevPx = G.px; G.prevPy = G.py; G.prevCamX = 0;
     G.runDiff = (Difficulty)CFG.difficulty;
     G.maxLives = G.lives = DP.lives;
     G.best = S.bestD[G.runDiff];
@@ -563,11 +568,14 @@ static void fell(void) {
     G.px = G.safeX; G.py = G.safeY - 40;
     G.vx = G.vy = 0;
     if (G.camX > G.px - 120) G.camX = G.px - 120;
+    G.prevPx = G.px; G.prevPy = G.py; G.prevCamX = G.camX;
     for (int i = 0; i < G.nEnemies; i++)
         if (fabsf(G.enemies[i].x - G.px) < 180) G.enemies[i] = G.enemies[--G.nEnemies], i--;
 }
 
 static void update(float dt, const Input *in) {
+    G.prevPx = G.px; G.prevPy = G.py; G.prevCamX = G.camX;
+    for (int i = 0; i < G.nEnemies; i++) { G.enemies[i].prevX = G.enemies[i].x; G.enemies[i].prevY = G.enemies[i].y; }
     /* Horizontal movement */
     float target = in->move * (in->runHeld ? RUN : WALK);
     float accel = G.onGround ? (in->move == 0 ? 2600.0f : 2200.0f) : 1300.0f;
@@ -788,10 +796,19 @@ static float shakeX, shakeY;
 static void color(Uint8 r, Uint8 g, Uint8 b, Uint8 a) { SDL_SetRenderDrawColor(G.ren, r, g, b, a); }
 static void colorS(const Swatch *s) { color(s->r, s->g, s->b, 255); }
 
+/* Logical (960x540) rect -> device pixels. Both edges are rounded, so a
+ * rect keeps the same pixel size wherever it is on screen (no shimmering
+ * when the scale isn't a whole number). */
 static void fillS(float x, float y, float w, float h) { /* screen coords */
-    SDL_FRect rc = { x, y, w, h };
-    SDL_RenderFillRectF(G.ren, &rc);
+    int x0 = (int)lroundf(G.offX + x * G.scale), x1 = (int)lroundf(G.offX + (x + w) * G.scale);
+    int y0 = (int)lroundf(G.offY + y * G.scale), y1 = (int)lroundf(G.offY + (y + h) * G.scale);
+    if (x1 <= x0 || y1 <= y0) return;
+    SDL_Rect rc = { x0, y0, x1 - x0, y1 - y0 };
+    SDL_RenderFillRect(G.ren, &rc);
 }
+
+/* Round a logical length to whole device pixels. */
+static float snapPx(float v) { return roundf(v * G.scale) / G.scale; }
 
 static void fillW(float x, float y, float w, float h) { /* world coords */
     fillS(x - G.camX + shakeX, y + shakeY, w, h);
@@ -897,7 +914,7 @@ static void drawBackground(void) {
     color(255, 250, 220, 255); fillS(770, 70, 40, 40);
 
     color(250, 252, 255, 255); /* clouds */
-    float cx0 = G.camX * 0.1f;
+    float cx0 = snapPx(G.camX * 0.1f);
     for (int i = (int)floorf(cx0 / 280) - 1; i < (int)floorf((cx0 + VW) / 280) + 2; i++) {
         float x = i * 280 - cx0 + hashf(i * 7) * 120;
         float y = 40 + hashf(i * 13) * 120;
@@ -907,20 +924,22 @@ static void drawBackground(void) {
         fillS(x + w * 0.45f, y + 4, w * 0.35f, 10);
     }
 
-    color(130, 155, 205, 255); /* far mountains */
-    for (int sx = 0; sx < VW; sx += 3) {
-        float h = ridge(sx + G.camX * 0.2f, 140, 140, 270, false, 11);
-        fillS((float)sx, VH - h, 3, h);
-    }
-    color(235, 240, 250, 255); /* snow caps */
-    for (int sx = 0; sx < VW; sx += 3) {
-        float h = ridge(sx + G.camX * 0.2f, 140, 140, 270, false, 11);
-        if (h > 235) fillS((float)sx, VH - h, 3, (h - 235) * 0.8f);
+    /* Columns sit at fixed spots in each layer and slide with it, so the
+     * outline keeps its shape while scrolling. */
+    float far = snapPx(G.camX * 0.2f), near = snapPx(G.camX * 0.45f);
+    for (int k = (int)floorf(far / 3); k * 3 - far < VW; k++) {
+        float h = ridge(k * 3.0f, 140, 140, 270, false, 11);
+        color(130, 155, 205, 255); /* far mountains */
+        fillS(k * 3 - far, VH - h, 3, h);
+        if (h > 235) {
+            color(235, 240, 250, 255); /* snow caps */
+            fillS(k * 3 - far, VH - h, 3, (h - 235) * 0.8f);
+        }
     }
     color(95, 170, 120, 255); /* near hills */
-    for (int sx = 0; sx < VW; sx += 3) {
-        float h = ridge(sx + G.camX * 0.45f, 220, 70, 160, true, 97);
-        fillS((float)sx, VH - h, 3, h);
+    for (int k = (int)floorf(near / 3); k * 3 - near < VW; k++) {
+        float h = ridge(k * 3.0f, 220, 70, 160, true, 97);
+        fillS(k * 3 - near, VH - h, 3, h);
     }
 }
 
@@ -1220,8 +1239,8 @@ static void drawDev(void) {
 static void render(void) {
     shakeX = shakeY = 0;
     if (G.shake > 0) {
-        shakeX = (frand() - 0.5f) * 14 * G.shake / 0.3f;
-        shakeY = (frand() - 0.5f) * 14 * G.shake / 0.3f;
+        shakeX = snapPx((frand() - 0.5f) * 14 * G.shake / 0.3f);
+        shakeY = snapPx((frand() - 0.5f) * 14 * G.shake / 0.3f);
     }
     drawBackground();
     drawWorld();
@@ -1337,20 +1356,59 @@ static void updateSettings(const Input *in) {
 
 /* ----------------------------------------------------------------- main */
 
+/* Draw the frame `alpha` (0..1) of the way between the last two physics
+ * steps, with the camera and moving things snapped to whole device pixels.
+ * Physics runs at 120 steps/s; this keeps motion smooth at any frame rate. */
+static void renderFrame(float alpha) {
+    int ow = VW, oh = VH;
+    SDL_GetRendererOutputSize(G.ren, &ow, &oh);
+    G.scale = fminf(ow / (float)VW, oh / (float)VH);
+    G.offX = roundf((ow - VW * G.scale) / 2);
+    G.offY = roundf((oh - VH * G.scale) / 2);
+    SDL_Rect clip = { (int)G.offX, (int)G.offY, (int)lroundf(VW * G.scale), (int)lroundf(VH * G.scale) };
+    SDL_RenderSetClipRect(G.ren, &clip);
+
+    static float ex[MAX_ENEMIES], ey[MAX_ENEMIES];
+    float cam = G.camX, px = G.px, py = G.py;
+    #define LERP(a, b) ((a) + ((b) - (a)) * alpha)
+    G.camX = snapPx(LERP(G.prevCamX, cam));
+    G.px = G.camX + snapPx(LERP(G.prevPx, px) - G.camX);
+    G.py = snapPx(LERP(G.prevPy, py));
+    for (int i = 0; i < G.nEnemies; i++) {
+        Enemy *e = &G.enemies[i];
+        ex[i] = e->x; ey[i] = e->y;
+        e->x = G.camX + snapPx(LERP(e->prevX, e->x) - G.camX);
+        e->y = snapPx(LERP(e->prevY, e->y));
+    }
+    #undef LERP
+    render();
+    G.camX = cam; G.px = px; G.py = py;
+    for (int i = 0; i < G.nEnemies; i++) { G.enemies[i].x = ex[i]; G.enemies[i].y = ey[i]; }
+}
+
+static int displayHz(void) {
+    SDL_DisplayMode m;
+    if (!G.win || SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(G.win), &m) != 0) return 0;
+    return m.refresh_rate;
+}
+
 /* Wait until the next frame is due for the chosen FPS limit. Sleeps most of
  * the wait and spins the last ~1.5 ms, since SDL_Delay is only ms-accurate. */
-static void limitFrame(Uint64 *next) {
+static void limitFrame(Uint64 *next, int hz) {
     const Uint64 freq = SDL_GetPerformanceFrequency();
     const Uint64 period = freq / (Uint64)FPS_OPTIONS[CFG.fps];
     *next += period;
+    /* vsync is on, so the next present waits for the screen anyway: wake half a
+     * refresh early and let it line the frame up with the screen. */
+    Uint64 until = *next - (hz > 0 ? freq / (Uint64)hz / 2 : 0);
     Uint64 now = SDL_GetPerformanceCounter();
-    if (now >= *next) {                    /* running late: don't try to catch up */
-        if (now - *next > period) *next = now;
+    if (now >= until) {                    /* running late: don't try to catch up */
+        if (now > *next + period) *next = now;
         return;
     }
     Uint64 spin = freq * 3 / 2000;
-    if (*next - now > spin) SDL_Delay((Uint32)((*next - now - spin) * 1000 / freq));
-    while (SDL_GetPerformanceCounter() < *next) {}
+    if (until - now > spin) SDL_Delay((Uint32)((until - now - spin) * 1000 / freq));
+    while (SDL_GetPerformanceCounter() < until) {}
 }
 
 static void setFullscreen(bool on) {
@@ -1360,6 +1418,8 @@ static void setFullscreen(bool on) {
 }
 
 /* Headless: simulate a few seconds of scripted play and save a BMP. */
+static void renderFrame(float alpha);
+
 static int screenshot(const char *path, State view) {
     SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormat(0, VW, VH, 32, SDL_PIXELFORMAT_ARGB8888);
     if (!surf) { fprintf(stderr, "surface: %s\n", SDL_GetError()); return 1; }
@@ -1380,7 +1440,7 @@ static int screenshot(const char *path, State view) {
     endRun();
     if (view == ST_SETTINGS) openSettings(ST_TITLE);
     else if (view != ST_PLAY) G.st = view;
-    render();
+    renderFrame(1);
     SDL_RenderPresent(G.ren);
     int rc = SDL_SaveBMP(surf, path);
     printf(rc == 0 ? "saved %s (score %d)\n" : "failed to save %s\n", path, G.score);
@@ -1449,10 +1509,10 @@ int main(int argc, char **argv) {
     G.win = SDL_CreateWindow("DS3 Jumper", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                              VW, VH, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!G.win) { fprintf(stderr, "window: %s\n", SDL_GetError()); return 1; }
-    G.ren = SDL_CreateRenderer(G.win, -1, SDL_RENDERER_ACCELERATED); /* paced by the FPS limit */
+    /* vsync stops tearing; lower FPS limits are paced by limitFrame on top */
+    G.ren = SDL_CreateRenderer(G.win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!G.ren) G.ren = SDL_CreateRenderer(G.win, -1, 0);
     if (!G.ren) { fprintf(stderr, "renderer: %s\n", SDL_GetError()); return 1; }
-    SDL_RenderSetLogicalSize(G.ren, VW, VH);
     SDL_SetRenderDrawBlendMode(G.ren, SDL_BLENDMODE_BLEND);
     if (!windowed) setFullscreen(true);
 
@@ -1511,6 +1571,11 @@ int main(int argc, char **argv) {
             G.fpsFrames = 0; G.fpsTimer = 0; G.frameMsMaxAcc = 0; G.updAcc = 0; G.drawAcc = 0;
         }
         if (dt > 0.05f) dt = 0.05f;
+        /* Snap a frame time that is within 1.5 ms of the expected one to exactly
+         * that, so every 60 FPS frame runs exactly 2 physics steps (not 1-3-2...). */
+        int hz = displayHz();
+        int target = FPS_OPTIONS[CFG.fps] < hz || hz <= 0 ? FPS_OPTIONS[CFG.fps] : hz;
+        if (fabsf(dt - 1.0f / target) < 0.0015f) dt = 1.0f / target;
 
         readInput(&in, dt);
         if (in.triP) setFullscreen(!G.fullscreen);
@@ -1541,7 +1606,7 @@ int main(int argc, char **argv) {
             if (in.jumpP) G.jumpBuf = 0.12f;
             acc += dt;
             Uint64 u0 = SDL_GetPerformanceCounter();
-            while (acc >= STEP && G.st == ST_PLAY) {
+            while (acc >= STEP * 0.999f && G.st == ST_PLAY) {
                 update(STEP, &in);
                 acc -= STEP;
                 G.stepsThisFrame++;
@@ -1582,10 +1647,11 @@ int main(int argc, char **argv) {
         Uint64 r0 = SDL_GetPerformanceCounter();
         color(0, 0, 0, 255);
         SDL_RenderClear(G.ren);
-        render();
+        renderFrame(G.st == ST_PLAY ? clampf(acc / STEP, 0, 1) : 1);
         G.drawAcc += (float)(SDL_GetPerformanceCounter() - r0) * 1000 / (float)SDL_GetPerformanceFrequency();
         SDL_RenderPresent(G.ren);
-        limitFrame(&nextFrame);
+        if (FPS_OPTIONS[CFG.fps] < hz || hz <= 0) limitFrame(&nextFrame, hz);
+        else nextFrame = SDL_GetPerformanceCounter();
     }
 
     endRun(); /* save a run that was in progress when quitting */
