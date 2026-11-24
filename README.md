@@ -5,7 +5,7 @@ Written in C99 with SDL2 — runs on **Linux, macOS and other Unix systems**.
 
 ![screenshot](docs/screenshot.png)
 
-Run, jump over gaps, grab coins and stomp enemies in an endless, procedurally
+Run, jump over gaps, grab coins and stomp five kinds of enemies in an endless, procedurally
 generated world that gets harder the further you go. The controller rumbles when
 you get hit, grab coins or stomp enemies, and LED 1 lights up (no more blinking).
 Retro sound effects and an original chiptune soundtrack are synthesized in code.
@@ -35,11 +35,34 @@ make stats      # show your saved stats
 
 Or run the binary directly: `./ds3-jumper [--windowed] [--stats]`.
 
+## Enemies
+
+| Enemy | Looks like | How to beat it | Points |
+|---|---|---|---|
+| Blob | purple blob | stomp it | 50 |
+| Hopper | green frog that jumps | stomp it (time it between hops) | 75 |
+| Flyer | bee flying in a wave, can cross gaps | stomp it or run under it | 100 |
+| Spiky | red hedgehog with spikes | **can't be stomped**, jump over it | — |
+| Armored | beetle with a steel helmet | stomp twice: the helmet flies off, then it gets angry and fast | 25 + 150 |
+
+New kinds show up the further you run.
+
+## Difficulty
+
+Pick it on the title screen (**DIFFICULTY**, left/right). Each difficulty has its
+own best score.
+
+| | Lives | Enemies | New enemy kinds | Gets hard by |
+|---|---|---|---|---|
+| EASY | 5 | fewer, slower | late | ~4000 m |
+| MEDIUM | 3 | normal | gradually | ~2500 m |
+| HARD | 2 | more, faster | almost right away | ~1400 m |
+
 ## Settings
 
 **SETTINGS** on the title screen or the pause menu: character colours (hair,
 skin, shirt, pants, scarf), sound effects, music, volume, rumble and an
-**FPS limit** of 30, 60, 90 or 120 (default 60). Everything is saved to
+**FPS limit** of 30, 60, 90 or 120 (default 60). The difficulty is saved there too. Everything is saved to
 `settings.txt` next to the save file (see below), e.g. `fps = 90`.
 
 The game can't show more frames than your screen refreshes: on a 60 Hz monitor
@@ -61,6 +84,9 @@ Set `DS3_JUMPER_SAVE=/some/file.txt` to use a different file. It looks like:
 ```ini
 # ds3-jumper save file
 best_score = 1520
+best_score_easy = 0
+best_score_medium = 1520
+best_score_hard = 0
 last_score = 830
 games_played = 12
 coins_total = 214
@@ -75,9 +101,9 @@ Your best score and totals are shown on the title screen, and printed in the
 terminal when the game starts and when you quit:
 
 ```text
-Best score: 2615  (14 games played)
+Best scores: EASY 0   MEDIUM 2615   HARD 0  (14 games played)
 ...
-Last score: 1830   Best score: 2615
+Last score: 1830 (MEDIUM)   Best on MEDIUM: 2615
 ```
 
 Delete the file to reset.

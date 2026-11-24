@@ -27,7 +27,6 @@
 #define EW 26.0f
 #define EH 22.0f
 #define DEATH_Y (VH + 120)
-#define START_LIVES 3
 
 #define MAX_SOLIDS 256
 #define MAX_COINS 512
@@ -38,7 +37,31 @@
 
 typedef struct { float x, y, w, h; bool ground; } Solid;
 typedef struct { float x, y; } Coin;
-typedef struct { float x, y, vx, minx, maxx; } Enemy;
+typedef enum { EN_WALKER, EN_HOPPER, EN_FLYER, EN_SPIKY, EN_ARMORED, EN_KINDS } EnemyKind;
+typedef struct {
+    EnemyKind kind;
+    float x, y, vx, vy, minx, maxx;
+    float baseY;  /* ground line (hopper) or flight centre (flyer) */
+    float t;      /* per-enemy timer: hop countdown / flight phase */
+    int hp;       /* armored: 2 = helmet on */
+} Enemy;
+
+typedef enum { DIFF_EASY, DIFF_MEDIUM, DIFF_HARD, DIFF_COUNT } Difficulty;
+typedef struct {
+    const char *name;
+    int lives;
+    float enemyChance, enemySpeed, rampDist, unlockScale, gapScale, invuln;
+} DiffParams;
+/* rampDist: distance (px) until the world is fully hard.
+ * unlockScale: multiplies the distance at which each enemy type first appears. */
+static const DiffParams DIFFS[DIFF_COUNT] = {
+    { "EASY",   5, 0.65f, 0.75f, 40000, 1.6f, 0.80f, 2.0f },
+    { "MEDIUM", 3, 1.00f, 1.00f, 25000, 1.0f, 1.00f, 1.5f },
+    { "HARD",   2, 1.40f, 1.30f, 14000, 0.4f, 1.15f, 1.0f },
+};
+/* Distance (px, MEDIUM) where each enemy type starts to appear. */
+static const float UNLOCK_AT[EN_KINDS] = { 0, 2500, 6000, 9000, 13000 };
+static const int STOMP_POINTS[EN_KINDS] = { 50, 75, 100, 0, 150 };
 typedef struct { float x, y, vx, vy, life, max, size; Uint8 r, g, b; } Part;
 
 typedef enum { ST_TITLE, ST_PLAY, ST_PAUSE, ST_OVER, ST_SETTINGS } State;
@@ -90,7 +113,10 @@ static struct {
     bool sfx, music, rumble;
     int volume; /* 0..10 */
     int fps;    /* index into FPS_OPTIONS */
-} CFG = { 0, 0, 0, 0, 0, true, true, true, 7, 1 };
+    int difficulty;
+} CFG = { 0, 0, 0, 0, 0, true, true, true, 7, 1, DIFF_MEDIUM };
+
+#define DP (DIFFS[CFG.difficulty])
 
 static const int FPS_OPTIONS[] = { 30, 60, 90, 120 };
 
@@ -112,7 +138,8 @@ static struct {
     int facing;
     float safeX, safeY;
 
-    int lives, coins, bonus, score, best, stomps;
+    int lives, maxLives, coins, bonus, score, best, stomps;
+    Difficulty runDiff; /* difficulty of the current run */
     bool runActive, noSave, newBest, playedThisSession, sessionNewBest;
 
     /* dev mode */
@@ -186,7 +213,10 @@ static void loadSettings(void) {
         else if (!strcmp(key, "music")) CFG.music = on;
         else if (!strcmp(key, "rumble")) CFG.rumble = on;
         else if (!strcmp(key, "volume")) CFG.volume = (int)clampf((float)atoi(val), 0, 10);
-        else if (!strcmp(key, "fps")) {
+        else if (!strcmp(key, "difficulty")) {
+            for (int i = 0; i < DIFF_COUNT; i++)
+                if (!strcmp(DIFFS[i].name, val)) CFG.difficulty = i;
+        } else if (!strcmp(key, "fps")) {
             for (int i = 0; i < (int)LEN(FPS_OPTIONS); i++)
                 if (FPS_OPTIONS[i] == atoi(val)) CFG.fps = i;
         }
@@ -209,6 +239,7 @@ static void writeSettings(void) {
     fprintf(f, "volume = %d\n", CFG.volume);
     fprintf(f, "rumble = %s\n", CFG.rumble ? "on" : "off");
     fprintf(f, "fps = %d\n", FPS_OPTIONS[CFG.fps]);
+    fprintf(f, "difficulty = %s\n", DIFFS[CFG.difficulty].name);
     fclose(f);
 }
 
@@ -217,6 +248,7 @@ static void writeSettings(void) {
 /* Plain "key=value" text file in the per-user data directory. */
 static struct {
     int best, last, games, coinsTotal, bestCoins, stompsTotal;
+    int bestD[DIFF_COUNT]; /* best score per difficulty */
     double distanceTotal, playSeconds;
 } S;
 
@@ -239,6 +271,9 @@ static void loadSave(void) {
     while (fgets(line, sizeof line, f)) {
         if (line[0] == '#' || sscanf(line, " %63[^= ] = %lf", key, &v) != 2) continue;
         if (!strcmp(key, "best_score")) S.best = (int)v;
+        else if (!strcmp(key, "best_score_easy")) S.bestD[DIFF_EASY] = (int)v;
+        else if (!strcmp(key, "best_score_medium")) S.bestD[DIFF_MEDIUM] = (int)v;
+        else if (!strcmp(key, "best_score_hard")) S.bestD[DIFF_HARD] = (int)v;
         else if (!strcmp(key, "last_score")) S.last = (int)v;
         else if (!strcmp(key, "games_played")) S.games = (int)v;
         else if (!strcmp(key, "coins_total")) S.coinsTotal = (int)v;
@@ -248,6 +283,8 @@ static void loadSave(void) {
         else if (!strcmp(key, "play_seconds")) S.playSeconds = v;
     }
     fclose(f);
+    /* Saves from before difficulties existed were played on MEDIUM */
+    if (!S.bestD[DIFF_EASY] && !S.bestD[DIFF_MEDIUM] && !S.bestD[DIFF_HARD]) S.bestD[DIFF_MEDIUM] = S.best;
 }
 
 static void writeSave(void) {
@@ -261,6 +298,9 @@ static void writeSave(void) {
     strftime(date, sizeof date, "%Y-%m-%d %H:%M", localtime(&now));
     fprintf(f, "# ds3-jumper save file\n");
     fprintf(f, "best_score = %d\n", S.best);
+    fprintf(f, "best_score_easy = %d\n", S.bestD[DIFF_EASY]);
+    fprintf(f, "best_score_medium = %d\n", S.bestD[DIFF_MEDIUM]);
+    fprintf(f, "best_score_hard = %d\n", S.bestD[DIFF_HARD]);
     fprintf(f, "last_score = %d\n", S.last);
     fprintf(f, "games_played = %d\n", S.games);
     fprintf(f, "coins_total = %d\n", S.coinsTotal);
@@ -281,14 +321,15 @@ static void endRun(void) {
     S.games++;
     S.last = G.score;
     G.playedThisSession = true;
-    G.newBest = G.score > S.best;
-    if (G.newBest) { S.best = G.score; G.sessionNewBest = true; }
+    G.newBest = G.score > S.bestD[G.runDiff];
+    if (G.newBest) { S.bestD[G.runDiff] = G.score; G.sessionNewBest = true; }
+    if (G.score > S.best) S.best = G.score;
     S.coinsTotal += G.coins;
     if (G.coins > S.bestCoins) S.bestCoins = G.coins;
     S.stompsTotal += G.stomps;
     S.distanceTotal += G.dist;
     S.playSeconds += G.runSeconds;
-    G.best = S.best;
+    G.best = S.bestD[G.runDiff];
     writeSave();
 }
 
@@ -332,10 +373,59 @@ static void addCoin(float x, float y) {
     G.coinArr[G.nCoins++] = (Coin){ x, y };
 }
 
-static void addEnemy(float minx, float maxx, float y) {
+static void enemySize(EnemyKind k, float *w, float *h) {
+    switch (k) {
+    case EN_HOPPER: *w = 24; *h = 20; break;
+    case EN_FLYER: *w = 26; *h = 18; break;
+    case EN_SPIKY: *w = 28; *h = 22; break;
+    case EN_ARMORED: *w = 30; *h = 24; break;
+    default: *w = EW; *h = EH; break;
+    }
+}
+
+static float enemyBaseSpeed(EnemyKind k) {
+    switch (k) {
+    case EN_HOPPER: return 45;
+    case EN_FLYER: return 80;
+    case EN_SPIKY: return 40;
+    case EN_ARMORED: return 50;
+    default: return 60;
+    }
+}
+
+/* Pick an enemy type among those unlocked at this distance; newer ones are rarer. */
+static EnemyKind pickEnemy(float x) {
+    float weights[EN_KINDS], total = 0;
+    for (int k = 0; k < EN_KINDS; k++) {
+        float at = UNLOCK_AT[k] * DP.unlockScale;
+        weights[k] = x < at ? 0 : k == EN_WALKER ? 3.0f : clampf((x - at) / 4000.0f, 0.4f, 1.6f);
+        total += weights[k];
+    }
+    float r = frand() * total;
+    for (int k = 0; k < EN_KINDS; k++) {
+        if (r < weights[k]) return (EnemyKind)k;
+        r -= weights[k];
+    }
+    return EN_WALKER;
+}
+
+/* groundY = top of the ground the enemy lives on. */
+static void addEnemy(EnemyKind k, float minx, float maxx, float groundY) {
+    float w, h;
+    enemySize(k, &w, &h);
+    maxx -= w;
     if (G.nEnemies >= MAX_ENEMIES || maxx <= minx) return;
-    float x = minx + frand() * (maxx - minx);
-    G.enemies[G.nEnemies++] = (Enemy){ x, y, frand() < 0.5f ? -60.0f : 60.0f, minx, maxx };
+    Enemy e = { 0 };
+    e.kind = k;
+    e.minx = minx; e.maxx = maxx;
+    e.x = minx + frand() * (maxx - minx);
+    e.y = groundY - h;
+    e.vx = enemyBaseSpeed(k) * DP.enemySpeed * (frand() < 0.5f ? -1 : 1);
+    e.baseY = e.y;
+    e.t = 0.6f + frand();
+    e.hp = k == EN_ARMORED ? 2 : 1;
+    if (k == EN_FLYER) { e.baseY = groundY - 95 - frand() * 25; e.y = e.baseY; e.t = frand() * 6.28f; }
+    G.enemies[G.nEnemies++] = e;
 }
 
 /* Time in the air for a full jump that lands `rise` px higher (negative = lower). */
@@ -346,14 +436,14 @@ static float airTime(float rise) {
 }
 
 static void genChunk(void) {
-    float diff = clampf(G.genX / 25000.0f, 0, 1);
+    float diff = clampf(G.genX / DP.rampDist, 0, 1);
 
     float dy = (frand() - 0.5f) * 2 * (40 + 40 * diff);
     float newY = clampf(G.genY + dy, 300, 470);
     float rise = G.genY - newY;
     if (rise > 80) { newY = G.genY - 80; rise = 80; }
 
-    float gap = 40 + frand() * (60 + 120 * diff);
+    float gap = (40 + frand() * (60 + 120 * diff)) * DP.gapScale;
     float maxGap = 0.75f * RUN * airTime(rise) - PW;
     if (gap > maxGap) gap = maxGap;
     if (frand() < 0.12f) gap = 0;
@@ -374,8 +464,14 @@ static void genChunk(void) {
         for (int i = 0; i < n; i++) addCoin(cx + i * 26, newY - 40);
     }
 
-    if (w > 280 && frand() < 0.3f + 0.45f * diff)
-        addEnemy(x + 20, x + w - 20 - EW, newY - EH);
+    if (w > 280 && frand() < (0.3f + 0.45f * diff) * DP.enemyChance) {
+        EnemyKind k = pickEnemy(x);
+        if (k == EN_FLYER) addEnemy(k, x - gap * 0.5f, x + w, newY); /* may cross the gap */
+        else addEnemy(k, x + 20, x + w - 20, newY);
+        /* long platforms can get a second enemy further on */
+        if (w > 420 && frand() < 0.35f * diff * DP.enemyChance)
+            addEnemy(pickEnemy(x), x + w * 0.55f, x + w - 20, newY);
+    }
 
     if (frand() < 0.45f) {
         float fw = 80 + frand() * 90;
@@ -402,7 +498,7 @@ static void prune(void) {
     G.nCoins = j;
     j = 0;
     for (int i = 0; i < G.nEnemies; i++)
-        if (G.enemies[i].maxx + EW > edge) G.enemies[j++] = G.enemies[i];
+        if (G.enemies[i].maxx + 40 > edge) G.enemies[j++] = G.enemies[i];
     G.nEnemies = j;
 }
 
@@ -418,7 +514,10 @@ static void resetWorld(void) {
     G.coyote = G.jumpBuf = G.invuln = G.squash = 0;
     G.safeX = G.px; G.safeY = G.py;
     G.camX = 0; G.dist = 0;
-    G.lives = START_LIVES; G.coins = G.bonus = G.score = G.stomps = 0;
+    G.runDiff = (Difficulty)CFG.difficulty;
+    G.maxLives = G.lives = DP.lives;
+    G.best = S.bestD[G.runDiff];
+    G.coins = G.bonus = G.score = G.stomps = 0;
     G.shake = 0;
     while (G.genX < G.camX + VW + 400) genChunk();
 }
@@ -455,7 +554,7 @@ static void hurt(bool fall) {
     audio_play(fall ? SFX_FALL : SFX_HURT);
     spawn(G.px + PW / 2, G.py + PH / 2, 24, 230, 70, 70, 260, 120);
     if (G.lives <= 0) { gameOver(); return; }
-    G.invuln = 1.5f;
+    G.invuln = DIFFS[G.runDiff].invuln;
 }
 
 static void fell(void) {
@@ -533,23 +632,45 @@ static void update(float dt, const Input *in) {
     for (int i = 0; i < G.nEnemies; i++) {
         Enemy *e = &G.enemies[i];
         if (e->x > G.camX + VW + 100) continue;
+        float ew, eh;
+        enemySize(e->kind, &ew, &eh);
         e->x += e->vx * dt;
         if (e->x < e->minx) { e->x = e->minx; e->vx = fabsf(e->vx); }
         if (e->x > e->maxx) { e->x = e->maxx; e->vx = -fabsf(e->vx); }
-        if (!overlap(G.px, G.py, PW, PH, e->x, e->y, EW, EH)) continue;
-        if (G.vy > 0 && G.py + PH - e->y < 16) {
-            spawn(e->x + EW / 2, e->y + EH / 2, 18, 160, 80, 190, 220, 80);
-            G.enemies[i] = G.enemies[--G.nEnemies]; i--;
+        if (e->kind == EN_HOPPER) {
+            e->t -= dt;
+            if (e->y >= e->baseY && e->t <= 0) { e->vy = -560; e->t = 1.0f + frand() * 0.8f; }
+            e->vy += GRAV * dt;
+            e->y += e->vy * dt;
+            if (e->y >= e->baseY) { e->y = e->baseY; e->vy = 0; }
+        } else if (e->kind == EN_FLYER) {
+            e->t += dt * 2.6f;
+            e->y = e->baseY + sinf(e->t) * 32;
+        }
+        if (!overlap(G.px, G.py, PW, PH, e->x, e->y, ew, eh)) continue;
+        bool fromAbove = G.vy > 0 && G.py + PH - e->y < 16;
+        if (fromAbove && e->kind != EN_SPIKY) {
             G.vy = in->jumpHeld ? -620 : -420;
-            G.bonus += 50;
-            G.stomps++;
             audio_play(SFX_STOMP);
             rumble(0x6000, 0, 90);
+            if (e->kind == EN_ARMORED && e->hp > 1) { /* helmet flies off, now it's angry */
+                e->hp--;
+                e->vx = (e->vx < 0 ? -1 : 1) * 120 * DIFFS[G.runDiff].enemySpeed;
+                spawn(e->x + ew / 2, e->y, 12, 150, 160, 175, 200, 120);
+                G.bonus += 25;
+                continue;
+            }
+            spawn(e->x + ew / 2, e->y + eh / 2, 18, 160, 80, 190, 220, 80);
+            G.bonus += STOMP_POINTS[e->kind];
+            G.stomps++;
+            G.enemies[i] = G.enemies[--G.nEnemies]; i--;
         } else if (G.invuln <= 0) {
             G.vy = -380;
             G.vx = (G.px < e->x) ? -250 : 250;
             hurt(false);
             if (G.st != ST_PLAY) return;
+        } else if (fromAbove) {
+            G.vy = -300; /* bounce off spikes while invulnerable */
         }
     }
 
@@ -803,6 +924,82 @@ static void drawBackground(void) {
     }
 }
 
+/* Two eyes looking where the enemy walks. */
+static void eyes(float x, float y, float gap, float dir) {
+    float d = dir > 0 ? 3 : -1;
+    color(255, 255, 255, 255);
+    fillW(x + d, y, 6, 7); fillW(x + gap + d, y, 6, 7);
+    color(30, 20, 40, 255);
+    fillW(x + 2 + d, y + 2, 3, 4); fillW(x + gap + 2 + d, y + 2, 3, 4);
+}
+
+static void drawEnemy(const Enemy *e) {
+    float w, h, x = e->x, y = e->y;
+    enemySize(e->kind, &w, &h);
+    float wob = sinf(G.time * 12 + e->x) * 2;
+    switch (e->kind) {
+    case EN_WALKER: /* purple blob */
+        color(110, 45, 130, 255); fillW(x, y + 4, w, h - 4);
+        color(160, 80, 190, 255); fillW(x + 2, y + 2, w - 4, h - 8);
+        color(90, 35, 105, 255);
+        fillW(x + 3, y + h - 3 + wob * 0.5f, 7, 4);
+        fillW(x + w - 10, y + h - 3 - wob * 0.5f, 7, 4);
+        eyes(x + 6, y + 6, 9, e->vx);
+        break;
+    case EN_HOPPER: { /* green frog, legs stretch in the air */
+        bool air = e->y < e->baseY - 1;
+        color(40, 120, 50, 255);
+        if (air) { fillW(x + 1, y + h - 2, 5, 8); fillW(x + w - 6, y + h - 2, 5, 8); }
+        else { fillW(x - 3, y + h - 5, 9, 5); fillW(x + w - 6, y + h - 5, 9, 5); }
+        color(70, 180, 80, 255); fillW(x, y + 5, w, h - 7);
+        color(120, 220, 110, 255); fillW(x + 4, y + 11, w - 8, h - 15);
+        color(70, 180, 80, 255); fillW(x + 2, y, 8, 8); fillW(x + w - 10, y, 8, 8);
+        eyes(x + 3, y + 1, 11, e->vx);
+        break;
+    }
+    case EN_FLYER: { /* bee with flapping wings */
+        bool up = fmodf(G.time * 14 + e->x, 2) < 1;
+        color(230, 240, 255, 200);
+        fillW(x + 6, y + (up ? -8 : -2), 8, 7); fillW(x + 14, y + (up ? -8 : -2), 8, 7);
+        color(250, 200, 40, 255); fillW(x, y + 3, w, h - 4);
+        color(40, 30, 30, 255);
+        fillW(x + 7, y + 3, 4, h - 4); fillW(x + 15, y + 3, 4, h - 4);
+        fillW(e->vx > 0 ? x - 4 : x + w, y + h / 2, 4, 3); /* stinger */
+        eyes(e->vx > 0 ? x + 16 : x + 1, y + 5, 0, e->vx);
+        break;
+    }
+    case EN_SPIKY: /* red hedgehog: don't stomp */
+        color(240, 240, 240, 255);
+        for (int k = 0; k < 5; k++) {
+            float sx = x + 2 + k * 5.5f;
+            fillW(sx + 1, y - 6, 2, 4); fillW(sx, y - 2, 4, 4);
+        }
+        color(170, 35, 40, 255); fillW(x, y + 2, w, h - 2);
+        color(220, 70, 60, 255); fillW(x + 2, y + 4, w - 4, h - 10);
+        color(120, 25, 30, 255);
+        fillW(x + 3, y + h - 3 + wob * 0.5f, 7, 4); fillW(x + w - 10, y + h - 3 - wob * 0.5f, 7, 4);
+        eyes(x + 7, y + 7, 9, e->vx);
+        break;
+    case EN_ARMORED: /* beetle, steel helmet takes the first stomp */
+        color(90, 60, 30, 255); fillW(x, y + 8, w, h - 8);
+        color(150, 100, 55, 255); fillW(x + 2, y + 10, w - 4, h - 14);
+        color(60, 40, 20, 255);
+        fillW(x + 3, y + h - 3 + wob * 0.5f, 7, 4); fillW(x + w - 10, y + h - 3 - wob * 0.5f, 7, 4);
+        if (e->hp > 1) {
+            color(120, 130, 150, 255); fillW(x - 2, y, w + 4, 10);
+            color(190, 200, 215, 255); fillW(x + 2, y + 1, w - 4, 3);
+            eyes(x + 8, y + 11, 9, e->vx);
+        } else { /* angry: red eyes, steam */
+            eyes(x + 8, y + 11, 9, e->vx);
+            color(230, 40, 40, 255); fillW(x + 8, y + 9, 15, 2);
+            color(255, 255, 255, 120);
+            fillW(x + 6, y - 6 - fmodf(G.time * 20, 6), 3, 3); fillW(x + w - 9, y - 4 - fmodf(G.time * 24, 6), 3, 3);
+        }
+        break;
+    default: break;
+    }
+}
+
 static void drawWorld(void) {
     float left = G.camX - 50, right = G.camX + VW + 50;
 
@@ -842,17 +1039,7 @@ static void drawWorld(void) {
     for (int i = 0; i < G.nEnemies; i++) {
         Enemy *e = &G.enemies[i];
         if (e->x < left || e->x > right) continue;
-        float wob = sinf(G.time * 12 + e->x) * 2;
-        color(110, 45, 130, 255); fillW(e->x, e->y + 4, EW, EH - 4);
-        color(160, 80, 190, 255); fillW(e->x + 2, e->y + 2, EW - 4, EH - 8);
-        color(90, 35, 105, 255);
-        fillW(e->x + 3, e->y + EH - 3 + wob * 0.5f, 7, 4);
-        fillW(e->x + EW - 10, e->y + EH - 3 - wob * 0.5f, 7, 4);
-        float d = e->vx > 0 ? 3 : -1;
-        color(255, 255, 255, 255);
-        fillW(e->x + 6 + d, e->y + 6, 6, 7); fillW(e->x + 15 + d, e->y + 6, 6, 7);
-        color(30, 20, 40, 255);
-        fillW(e->x + 8 + d, e->y + 8, 3, 4); fillW(e->x + 17 + d, e->y + 8, 3, 4);
+        drawEnemy(e);
     }
 
     bool blink = G.invuln > 0 && fmodf(G.time, 0.16f) < 0.08f;
@@ -879,8 +1066,9 @@ static void drawHUD(void) {
         snprintf(buf, sizeof buf, "BEST %d", G.best);
         text(buf, VW - 20 - textWidth(buf, 3), 16 + oy, 3, 230, 240, 255, false);
     }
-    for (int i = 0; i < START_LIVES; i++) {
-        float x = VW - 20 - (START_LIVES - i) * 26.0f, y = 42 + oy;
+    text(DIFFS[G.runDiff].name, VW - 20 - textWidth(DIFFS[G.runDiff].name, 2), 70 + oy, 2, 200, 210, 235, false);
+    for (int i = 0; i < G.maxLives; i++) {
+        float x = VW - 20 - (G.maxLives - i) * 26.0f, y = 42 + oy;
         color(20, 24, 40, 160); fillS(x + 2, y + 2, 20, 18);
         if (i < G.lives) color(235, 60, 70, 255); else color(90, 90, 110, 255);
         fillS(x, y + 4, 20, 8); fillS(x + 2, y, 6, 6); fillS(x + 12, y, 6, 6);
@@ -914,7 +1102,7 @@ static void drawMenu(const char *const *items, int n, int sel, float y, float sc
 
 static void drawHint(const char *s) { text(s, VW / 2, VH - 30, 2, 170, 180, 210, true); }
 
-static const char *const TITLE_MENU[] = { "START", "SETTINGS", "QUIT" };
+#define TITLE_ITEMS 4 /* START, DIFFICULTY, SETTINGS, QUIT */
 static const char *const PAUSE_MENU[] = { "RESUME", "RESTART", "SETTINGS", "MAIN MENU", "QUIT GAME" };
 
 enum { SET_HAIR, SET_SKIN, SET_SHIRT, SET_PANTS, SET_SCARF, SET_SFX, SET_MUSIC, SET_VOLUME,
@@ -1043,11 +1231,27 @@ static void render(void) {
         overlay(140);
         text("DS3 JUMPER", VW / 2, 80, 12, 255, 220, 80, true);
         text("A TINY PLATFORMER FOR THE PS3 CONTROLLER", VW / 2, 160, 3, 255, 255, 255, true);
-        drawMenu(TITLE_MENU, LEN(TITLE_MENU), G.menuSel, 230, 5);
+        {
+            char diff[40];
+            snprintf(diff, sizeof diff, "DIFFICULTY: %s", DIFFS[CFG.difficulty].name);
+            const char *items[TITLE_ITEMS] = { "START", diff, "SETTINGS", "QUIT" };
+            drawMenu(items, TITLE_ITEMS, G.menuSel, 215, 5);
+            if (G.menuSel == 1) {
+                static const char *const about[DIFF_COUNT] = {
+                    "5 LIVES - FEWER, SLOWER ENEMIES",
+                    "3 LIVES - THE NORMAL GAME",
+                    "2 LIVES - FAST ENEMIES, EVERY TYPE EARLY",
+                };
+                char line[96];
+                snprintf(line, sizeof line, "%s   (LEFT/RIGHT TO CHANGE)", about[CFG.difficulty]);
+                text(line, VW / 2, 372, 2, 200, 210, 235, true);
+            }
+        }
         if (S.games > 0) {
-            char buf[128];
-            snprintf(buf, sizeof buf, "BEST %d   LAST %d   GAMES %d   COINS %d   STOMPS %d",
-                     S.best, S.last, S.games, S.coinsTotal, S.stompsTotal);
+            char buf[160];
+            snprintf(buf, sizeof buf, "BEST %s %d   LAST %d   GAMES %d   COINS %d   STOMPS %d",
+                     DIFFS[CFG.difficulty].name, S.bestD[CFG.difficulty], S.last, S.games,
+                     S.coinsTotal, S.stompsTotal);
             text(buf, VW / 2, 400, 2, 255, 225, 120, true);
         }
         text("STICK/D-PAD MOVE   CROSS JUMP   SQUARE/R2 RUN   START PAUSE   TRIANGLE FULLSCREEN",
@@ -1070,7 +1274,7 @@ static void render(void) {
         text("GAME OVER", VW / 2, 120, 10, 255, 110, 100, true);
         {
             char buf[64];
-            snprintf(buf, sizeof buf, "SCORE %d   BEST %d", G.score, G.best);
+            snprintf(buf, sizeof buf, "SCORE %d   BEST %d (%s)", G.score, G.best, DIFFS[G.runDiff].name);
             text(buf, VW / 2, 220, 4, 255, 255, 255, true);
         }
         if (G.newBest && fmodf(G.time, 0.5f) < 0.35f)
@@ -1255,7 +1459,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < SDL_NumJoysticks(); i++) openPad(i);
 
     if (S.games > 0)
-        printf("Best score: %d  (%d games played)\n", S.best, S.games);
+        printf("Best scores: EASY %d   MEDIUM %d   HARD %d  (%d games played)\n",
+               S.bestD[DIFF_EASY], S.bestD[DIFF_MEDIUM], S.bestD[DIFF_HARD], S.games);
     else
         printf("No best score yet - go set one!\n");
     fflush(stdout);
@@ -1314,12 +1519,16 @@ int main(int argc, char **argv) {
 
         switch (G.st) {
         case ST_TITLE:
-            if (in.upP) { G.menuSel = cycle(G.menuSel, LEN(TITLE_MENU), -1); audio_play(SFX_MENU_MOVE); }
-            if (in.downP) { G.menuSel = cycle(G.menuSel, LEN(TITLE_MENU), 1); audio_play(SFX_MENU_MOVE); }
-            if (in.psP) G.quit = true;
+            if (in.upP) { G.menuSel = cycle(G.menuSel, TITLE_ITEMS, -1); audio_play(SFX_MENU_MOVE); }
+            if (in.downP) { G.menuSel = cycle(G.menuSel, TITLE_ITEMS, 1); audio_play(SFX_MENU_MOVE); }
+            if (G.menuSel == 1 && (in.leftP || in.rightP || in.confirmP)) {
+                CFG.difficulty = cycle(CFG.difficulty, DIFF_COUNT, in.leftP ? -1 : 1);
+                audio_play(SFX_TOGGLE);
+                writeSettings();
+            } else if (in.psP) G.quit = true;
             else if (in.confirmP || in.startP) {
                 if (G.menuSel == 0) newGame();
-                else if (G.menuSel == 1) { audio_play(SFX_MENU_OK); openSettings(ST_TITLE); }
+                else if (G.menuSel == 2) { audio_play(SFX_MENU_OK); openSettings(ST_TITLE); }
                 else G.quit = true;
             }
             break;
@@ -1382,7 +1591,8 @@ int main(int argc, char **argv) {
     endRun(); /* save a run that was in progress when quitting */
     writeSettings();
     if (G.playedThisSession) {
-        printf("Last score: %d   Best score: %d%s\n", S.last, S.best,
+        printf("Last score: %d (%s)   Best on %s: %d%s\n", S.last, DIFFS[G.runDiff].name,
+               DIFFS[G.runDiff].name, S.bestD[G.runDiff],
                G.sessionNewBest ? "  (NEW BEST this session!)" : "");
         printf("Stats: %s\n", savePath);
     }
