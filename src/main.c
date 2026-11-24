@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
 
 #include "audio.h"
 
@@ -116,6 +117,8 @@ static struct {
     int stepsThisFrame;
     float fpsTimer, fps, frameMs, frameMsMax, frameMsMaxAcc;
     int fpsFrames;
+    float updMs, drawMs, updAcc, drawAcc, cpuPct, memMB;
+    double lastCpuSec;
     float runSeconds;
     float dist, camX, time, shake;
 
@@ -859,16 +862,17 @@ static void drawWorld(void) {
 
 static void drawHUD(void) {
     char buf[96];
+    float oy = G.dev ? 14 : 0; /* make room for the dev line */
     snprintf(buf, sizeof buf, "SCORE %d", G.score);
-    text(buf, 20, 16, 4, 255, 255, 255, false);
+    text(buf, 20, 16 + oy, 4, 255, 255, 255, false);
     snprintf(buf, sizeof buf, "COINS %d", G.coins);
-    text(buf, 20, 44, 3, 255, 225, 90, false);
+    text(buf, 20, 44 + oy, 3, 255, 225, 90, false);
     if (G.best > 0) {
         snprintf(buf, sizeof buf, "BEST %d", G.best);
-        text(buf, VW - 20 - textWidth(buf, 3), 16, 3, 230, 240, 255, false);
+        text(buf, VW - 20 - textWidth(buf, 3), 16 + oy, 3, 230, 240, 255, false);
     }
     for (int i = 0; i < START_LIVES; i++) {
-        float x = VW - 20 - (START_LIVES - i) * 26.0f, y = 42;
+        float x = VW - 20 - (START_LIVES - i) * 26.0f, y = 42 + oy;
         color(20, 24, 40, 160); fillS(x + 2, y + 2, 20, 18);
         if (i < G.lives) color(235, 60, 70, 255); else color(90, 90, 110, 255);
         fillS(x, y + 4, 20, 8); fillS(x + 2, y, 6, 6); fillS(x + 12, y, 6, 6);
@@ -970,100 +974,41 @@ static void drawSettings(void) {
 
 /* ------------------------------------------------------------ dev mode */
 
-static void outlineW(float x, float y, float w, float h) {
-    SDL_FRect rc = { x - G.camX + shakeX, y + shakeY, w, h };
-    SDL_RenderDrawRectF(G.ren, &rc);
+static double cpuSeconds(void) {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
 }
 
-static void drawHitboxes(void) {
-    color(80, 255, 255, 200);
-    for (int i = 0; i < G.nSolids; i++)
-        outlineW(G.solids[i].x, G.solids[i].y, G.solids[i].w, G.solids[i].ground ? 40 : G.solids[i].h);
-    color(255, 230, 0, 220);
-    for (int i = 0; i < G.nCoins; i++) outlineW(G.coinArr[i].x - 7, G.coinArr[i].y - 7, 14, 14);
-    color(255, 60, 200, 230);
-    for (int i = 0; i < G.nEnemies; i++) {
-        Enemy *e = &G.enemies[i];
-        outlineW(e->x, e->y, EW, EH);
-        color(255, 60, 200, 90);
-        outlineW(e->minx, e->y + EH + 2, e->maxx - e->minx + EW, 2); /* patrol range */
-        color(255, 60, 200, 230);
-    }
-    color(G.onGround ? 80 : 255, 255, 80, 255);
-    outlineW(G.px, G.py, PW, PH);
+static float peakMemMB(void) {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+    return (float)ru.ru_maxrss / (1024 * 1024); /* bytes on macOS */
+#else
+    return (float)ru.ru_maxrss / 1024;          /* kilobytes on Linux/BSD */
+#endif
 }
 
-static const char *powerName(SDL_JoystickPowerLevel p) {
-    switch (p) {
-    case SDL_JOYSTICK_POWER_EMPTY: return "EMPTY";
-    case SDL_JOYSTICK_POWER_LOW: return "LOW";
-    case SDL_JOYSTICK_POWER_MEDIUM: return "MEDIUM";
-    case SDL_JOYSTICK_POWER_FULL: return "FULL";
-    case SDL_JOYSTICK_POWER_WIRED: return "WIRED (USB)";
-    case SDL_JOYSTICK_POWER_MAX: return "MAX";
-    default: return "UNKNOWN";
-    }
-}
-
+/* One-line performance overlay along the top-left edge. */
 static void drawDev(void) {
-    char l[24][96];
-    int n = 0;
-#define LINE(...) snprintf(l[n++], sizeof l[0], __VA_ARGS__)
-    SDL_RendererInfo ri = { 0 };
-    SDL_GetRendererInfo(G.ren, &ri);
-    int ow = 0, oh = 0;
-    SDL_GetRendererOutputSize(G.ren, &ow, &oh);
-    static const char *stateNames[] = { "TITLE", "PLAY", "PAUSE", "GAME OVER", "SETTINGS" };
-
-    LINE("DEV MODE  (SELECT / F3 TO HIDE)");
-    LINE("FPS %.0f   FRAME %.1f MS   MAX %.1f MS", G.fps, G.frameMs, G.frameMsMax);
-    LINE("PHYSICS STEPS/FRAME %d  (%.0f HZ)", G.stepsThisFrame, 1 / STEP);
-    LINE("RENDERER %s   VSYNC %s", ri.name ? ri.name : "?",
-         (ri.flags & SDL_RENDERER_PRESENTVSYNC) ? "ON" : "OFF");
-    LINE("OUTPUT %dX%d   LOGICAL %dX%d", ow, oh, VW, VH);
-    LINE("STATE %s   TIME %.1fS", stateNames[G.st], G.runSeconds);
-    LINE("POS %.0f, %.0f   VEL %.0f, %.0f", G.px, G.py, G.vx, G.vy);
-    LINE("GROUND %s  COYOTE %.2f  JUMPBUF %.2f  INVULN %.1f", G.onGround ? "YES" : "NO",
-         fmaxf(0, G.coyote), fmaxf(0, G.jumpBuf), G.invuln);
-    LINE("CAM %.0f   GEN %.0f   DIFFICULTY %.0f%%", G.camX, G.genX,
-         clampf(G.genX / 25000.0f, 0, 1) * 100);
-    LINE("SOLIDS %d  COINS %d  ENEMIES %d  PARTICLES %d", G.nSolids, G.nCoins, G.nEnemies, G.nParts);
-    LINE("SCORE %d = DIST %.0f + COINS %dX10 + STOMPS %d", G.score, G.dist, G.coins, G.bonus);
+    char pad[40] = "PAD NONE";
     if (G.pad) {
-        SDL_Joystick *js = SDL_GameControllerGetJoystick(G.pad);
-        LINE("PAD %s   BATTERY %s", SDL_GameControllerName(G.pad), powerName(SDL_JoystickCurrentPowerLevel(js)));
-        LINE("L STICK %+.2f %+.2f   R STICK %+.2f %+.2f", axis(SDL_CONTROLLER_AXIS_LEFTX),
-             axis(SDL_CONTROLLER_AXIS_LEFTY), axis(SDL_CONTROLLER_AXIS_RIGHTX), axis(SDL_CONTROLLER_AXIS_RIGHTY));
-        LINE("L2 %3.0f%%   R2 %3.0f%%   RUMBLE %s", axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT) * 100,
-             axis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT) * 100,
-             SDL_GameControllerHasRumble(G.pad) ? (CFG.rumble ? "ON" : "OFF") : "N/A");
-        static const struct { SDL_GameControllerButton b; const char *n; } B[] = {
-            { SDL_CONTROLLER_BUTTON_A, "CROSS" }, { SDL_CONTROLLER_BUTTON_B, "CIRCLE" },
-            { SDL_CONTROLLER_BUTTON_X, "SQUARE" }, { SDL_CONTROLLER_BUTTON_Y, "TRIANGLE" },
-            { SDL_CONTROLLER_BUTTON_LEFTSHOULDER, "L1" }, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, "R1" },
-            { SDL_CONTROLLER_BUTTON_LEFTSTICK, "L3" }, { SDL_CONTROLLER_BUTTON_RIGHTSTICK, "R3" },
-            { SDL_CONTROLLER_BUTTON_DPAD_UP, "UP" }, { SDL_CONTROLLER_BUTTON_DPAD_DOWN, "DOWN" },
-            { SDL_CONTROLLER_BUTTON_DPAD_LEFT, "LEFT" }, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT, "RIGHT" },
-            { SDL_CONTROLLER_BUTTON_START, "START" }, { SDL_CONTROLLER_BUTTON_BACK, "SELECT" },
-            { SDL_CONTROLLER_BUTTON_GUIDE, "PS" },
-        };
-        char pressed[96] = "BUTTONS:";
-        for (int i = 0; i < LEN(B); i++)
-            if (btn(B[i].b) && strlen(pressed) + strlen(B[i].n) + 2 < sizeof pressed) {
-                strcat(pressed, " ");
-                strcat(pressed, B[i].n);
-            }
-        LINE("%s", pressed);
-    } else {
-        LINE("PAD NONE (KEYBOARD)");
+        SDL_JoystickPowerLevel pl = SDL_JoystickCurrentPowerLevel(SDL_GameControllerGetJoystick(G.pad));
+        snprintf(pad, sizeof pad, "PAD %s", pl == SDL_JOYSTICK_POWER_WIRED ? "WIRED"
+                 : pl == SDL_JOYSTICK_POWER_FULL ? "BAT FULL" : pl == SDL_JOYSTICK_POWER_MEDIUM ? "BAT MED"
+                 : pl == SDL_JOYSTICK_POWER_LOW ? "BAT LOW" : "OK");
     }
-#undef LINE
-
-    float x = 16, y = 76, lh = 15;
-    color(5, 8, 20, 190);
-    fillS(x - 6, y - 6, 470, n * lh + 10);
-    for (int i = 0; i < n; i++)
-        text(l[i], x, y + i * lh, 2, i == 0 ? 255 : 160, i == 0 ? 220 : 255, i == 0 ? 80 : 170, false);
+    char line[200];
+    snprintf(line, sizeof line,
+             "FPS %.0f | FRAME %.1fMS (MAX %.1f) | CPU %.0f%% | UPDATE %.2fMS | DRAW %.2fMS | MEM %.0fMB | PHYS %d/F | OBJ %d | %s",
+             G.fps, G.frameMs, G.frameMsMax, G.cpuPct, G.updMs, G.drawMs, G.memMB, G.stepsThisFrame,
+             G.nSolids + G.nCoins + G.nEnemies + G.nParts, pad);
+    color(0, 0, 0, 170);
+    fillS(0, 0, textWidth(line, 2) + 12, 16);
+    Uint8 r = G.fps >= 55 ? 120 : G.fps >= 30 ? 255 : 255, g = G.fps >= 55 ? 255 : G.fps >= 30 ? 220 : 90;
+    color(r, g, 120, 255);
+    textRaw(line, 6, 3, 2);
 }
 
 static void render(void) {
@@ -1074,7 +1019,6 @@ static void render(void) {
     }
     drawBackground();
     drawWorld();
-    if (G.dev && G.st == ST_PLAY) drawHitboxes();
 
     switch (G.st) {
     case ST_TITLE:
@@ -1314,10 +1258,16 @@ int main(int argc, char **argv) {
         G.fpsTimer += dt;
         G.frameMsMaxAcc = fmaxf(G.frameMsMaxAcc, dt * 1000);
         if (G.fpsTimer >= 0.5f) {
+            double cpu = cpuSeconds();
             G.fps = G.fpsFrames / G.fpsTimer;
             G.frameMs = G.fpsTimer * 1000 / G.fpsFrames;
             G.frameMsMax = G.frameMsMaxAcc;
-            G.fpsFrames = 0; G.fpsTimer = 0; G.frameMsMaxAcc = 0;
+            G.updMs = G.updAcc / G.fpsFrames;
+            G.drawMs = G.drawAcc / G.fpsFrames;
+            G.cpuPct = (float)((cpu - G.lastCpuSec) / G.fpsTimer * 100);
+            G.lastCpuSec = cpu;
+            G.memMB = peakMemMB();
+            G.fpsFrames = 0; G.fpsTimer = 0; G.frameMsMaxAcc = 0; G.updAcc = 0; G.drawAcc = 0;
         }
         if (dt > 0.05f) dt = 0.05f;
 
@@ -1345,11 +1295,13 @@ int main(int argc, char **argv) {
             }
             if (in.jumpP) G.jumpBuf = 0.12f;
             acc += dt;
+            Uint64 u0 = SDL_GetPerformanceCounter();
             while (acc >= STEP && G.st == ST_PLAY) {
                 update(STEP, &in);
                 acc -= STEP;
                 G.stepsThisFrame++;
             }
+            G.updAcc += (float)(SDL_GetPerformanceCounter() - u0) * 1000 / (float)SDL_GetPerformanceFrequency();
             break;
         case ST_PAUSE:
             acc = 0;
@@ -1382,9 +1334,11 @@ int main(int argc, char **argv) {
         G.time += dt;
         G.shake = fmaxf(0, G.shake - dt);
 
+        Uint64 r0 = SDL_GetPerformanceCounter();
         color(0, 0, 0, 255);
         SDL_RenderClear(G.ren);
         render();
+        G.drawAcc += (float)(SDL_GetPerformanceCounter() - r0) * 1000 / (float)SDL_GetPerformanceFrequency();
         SDL_RenderPresent(G.ren);
     }
 

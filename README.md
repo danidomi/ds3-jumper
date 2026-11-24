@@ -73,40 +73,17 @@ Delete the file to reset.
 
 ## Dev mode
 
-Press **SELECT** (or **F3**) any time to toggle an overlay with FPS and frame
-time, physics steps per frame, renderer/VSync, output resolution, player
-position/velocity/state, camera and difficulty, entity counts, a score
-breakdown, and live controller data (sticks, L2/R2 pressure, pressed buttons,
-battery). During play it also draws hitboxes and enemy patrol ranges.
-Start with it on using `./ds3-jumper --dev`.
+Press **SELECT** (or **F3**) any time to toggle a one-line performance overlay
+in the top-left corner:
 
-## Controls
+```text
+FPS 60 | FRAME 16.7MS (MAX 17.2) | CPU 6% | UPDATE 0.12MS | DRAW 1.90MS | MEM 41MB | PHYS 2/F | OBJ 58 | PAD WIRED
+```
 
-| PS3 controller | Keyboard | Action |
-|---|---|---|
-| Left stick / D-pad | Arrows / A D | Move |
-| ✕ Cross | Space / Up / W / Z | Jump (hold for higher) |
-| □ Square / R2 | Shift / X | Run |
-| START | Enter / Esc / P | Pause |
-| SELECT | F3 / ` | Dev mode (FPS, metrics, hitboxes) |
-| △ Triangle | F / F11 | Toggle fullscreen |
-| PS | Q | Pause / quit (from menus) |
-
-In menus: **D-pad / stick** to choose, **✕** (Enter / Space) to confirm,
-**○** (Esc / Backspace) to go back.
-
-## Settings
-
-Open **Settings** from the title screen or the pause menu.
-
-![settings](docs/settings.png)
-
-- **Character:** hair, skin, shirt, pants and scarf colors, with a live preview
-- **Sound effects** on/off, **music** on/off, **volume** 0–100%
-- **Rumble** on/off
-
-Settings are saved to `settings.txt` next to the save file (see below), which you
-can also edit by hand. Override its location with `DS3_JUMPER_SETTINGS=/some/file.txt`.
+FPS and frame time (average / worst in the last 0.5 s), process CPU usage,
+time spent in game logic and in drawing per frame, peak memory, physics steps
+per frame, live object count and controller status. It's green at 55+ FPS,
+yellow at 30+, red below. Start with it on using `./ds3-jumper --dev`.
 
 ## Controller notes
 
